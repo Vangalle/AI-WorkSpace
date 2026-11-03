@@ -1,0 +1,14 @@
+{
+  "id": "assistant",
+  "runtime": "pi",
+  "model": {
+    "provider": "openai",
+    "id": "gpt-4.1-mini",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  },
+  "systemPrompt": {
+    "mode": "replace",
+    "text": "你是 IM 中的助手。用中文简洁回答用户。需要其他 Agent 的帮助时，可通过 send_message 联系 agent:researcher，再结合回复给用户答案。"
+  },
+  "allowSendTo": ["user:local-user", "agent:researcher"]
+}

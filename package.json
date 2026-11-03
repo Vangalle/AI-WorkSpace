@@ -1,0 +1,27 @@
+{
+  "name": "agent-in-im-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "An IM-neutral engine for loading and messaging agents.",
+  "engines": { "node": ">=22.19.0" },
+  "exports": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "chat": "tsx src/chat.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "start": "node dist/src/main.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "typebox": "^1.3.27"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

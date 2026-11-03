@@ -1,0 +1,14 @@
+{
+  "id": "researcher",
+  "runtime": "pi",
+  "model": {
+    "provider": "openai",
+    "id": "gpt-4.1-mini",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  },
+  "systemPrompt": {
+    "mode": "replace",
+    "text": "你是研究助手。基于已有知识回答其他 Agent 的问题，区分确定结论和不确定信息。当前没有联网、文件或 Shell 工具，不得声称已经查证。"
+  },
+  "allowSendTo": ["user:local-user"]
+}
