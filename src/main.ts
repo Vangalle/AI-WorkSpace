@@ -1,3 +1,4 @@
+/** Loopback HTTP entry: Pi factory + AgentEngine, bearer token printed on listen. */
 import { randomBytes } from 'node:crypto';
 import { AgentEngine } from './engine.js';
 import { createEngineServer } from './http.js';
@@ -11,7 +12,12 @@ const factory = new PiRuntimeFactory({
   ...(process.env.ENGINE_AUTH_PATH ? { authPath: process.env.ENGINE_AUTH_PATH } : {}),
 });
 const engine = new AgentEngine(factory);
-const server = createEngineServer(engine, { token });
+let userTokens: Record<string, string> | undefined;
+if (process.env.ENGINE_USER_TOKENS !== undefined) {
+  try { userTokens = JSON.parse(process.env.ENGINE_USER_TOKENS) as Record<string, string>; }
+  catch { throw new Error('ENGINE_USER_TOKENS must be a JSON object mapping user IDs to tokens'); }
+}
+const server = createEngineServer(engine, { token, ...(userTokens === undefined ? {} : { userTokens }) });
 server.on('error', (error: NodeJS.ErrnoException) => {
   console.error(`HTTP server failed: ${error.code ?? 'UNKNOWN'}`);
   void engine.close().finally(() => { process.exitCode = 1; });
@@ -22,6 +28,7 @@ server.listen(Number(rawPort), '127.0.0.1', () => {
     console.log(`Agent IM engine: http://127.0.0.1:${address.port}`);
     console.log(`Bearer token: ${token}`);
     console.log('Storage: memory only; no agents loaded. POST /agents to configure one.');
+    console.log('Shared chat: POST /rooms, then npm run room-chat -- <room-id>. @agent-id sends a command.');
   }
 });
 let stopping = false;

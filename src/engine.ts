@@ -2,8 +2,11 @@ import { randomUUID } from 'node:crypto';
 import type { ActorId, AgentConfig, AgentRuntime, AgentRuntimeFactory, AgentView, Conversation, Message, SendInput, SendResult } from './agent.js';
 import { abortable, checkSignal, EngineError, failure, safeError } from './errors.js';
 import { actor, agentConfig, identifier, invalid, sendInput, text } from './validation.js';
+import { ChatRooms } from './rooms/chat-rooms.js';
 
 interface Instance extends AgentView { runtime?: AgentRuntime }
+
+/** Root-request turn state: shared abort, busy agents, and nested-send budget. */
 interface Turn {
   controller: AbortController;
   agents: Set<ActorId>;
@@ -11,20 +14,44 @@ interface Turn {
   sendsLeft: number;
 }
 
+/**
+ * In-memory IM-neutral messaging engine.
+ * Owns identities, conversation membership, routing, idempotency, deadlines, and lifecycle.
+ * Inference and per-conversation history live in the injected runtime adapter.
+ */
 export class AgentEngine {
   private readonly agents = new Map<string, Instance>();
   private readonly conversations = new Map<string, Conversation>();
+  /** Serialize root requests per conversation so nested work stays inside one turn. */
   private readonly queues = new Map<string, Promise<unknown>>();
+  /** Idempotent replay cache keyed by sender + conversation + clientId. */
   private readonly replays = new Map<string, { fingerprint: string; result: Promise<SendResult> }>();
   private readonly turns = new Set<Turn>();
   private closed = false;
   private readonly timeoutMs: number;
 
-  constructor(private readonly factory: AgentRuntimeFactory, options: { timeoutMs?: number } = {}) {
+  readonly rooms: ChatRooms;
+
+  constructor(private readonly factory: AgentRuntimeFactory, options: { timeoutMs?: number; roomDebounceMs?: number; roomMaxWaitMs?: number } = {}) {
     this.timeoutMs = options.timeoutMs ?? 30_000;
     if (!Number.isFinite(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 300_000) invalid('timeoutMs must be between 1 and 300000');
+    this.rooms = new ChatRooms({
+      assertAgent: (id) => { this.assertOpen(); this.instance(id); },
+      observe: async (id, input, signal) => {
+        this.assertOpen();
+        const instance = this.instance(id);
+        if (instance.status !== 'running' || !instance.runtime) throw new EngineError('AGENT_UNAVAILABLE', 'Agent is not running', 409);
+        if (!instance.runtime.observe) throw new EngineError('UNSUPPORTED_RUNTIME', 'Runtime does not support room participation', 409);
+        return instance.runtime.observe(input, { signal });
+      },
+    }, {
+      timeoutMs: this.timeoutMs,
+      ...(options.roomDebounceMs === undefined ? {} : { debounceMs: options.roomDebounceMs }),
+      ...(options.roomMaxWaitMs === undefined ? {} : { maxWaitMs: options.roomMaxWaitMs }),
+    });
   }
 
+  /** Register a stopped agent. IDs must be unique. */
   registerAgent(value: AgentConfig): AgentView {
     this.assertOpen();
     const config = agentConfig(value);
@@ -40,6 +67,7 @@ export class AgentEngine {
 
   listAgents(): AgentView[] { return [...this.agents.keys()].map((id) => this.getAgent(id)); }
 
+  /** Load the runtime for an agent. Idempotent when already running. */
   async startAgent(id: string): Promise<AgentView> {
     this.assertOpen();
     const instance = this.instance(id);
@@ -63,11 +91,13 @@ export class AgentEngine {
     }
   }
 
+  /** Abort active turns that touch this agent, dispose its runtime, and allow restart. */
   async stopAgent(id: string): Promise<AgentView> {
     const instance = this.instance(id);
     if (instance.status === 'loading' || instance.status === 'stopping') throw new EngineError('AGENT_BUSY', 'Agent lifecycle operation in progress', 409);
     instance.status = 'stopping';
-    const actorId: ActorId = `agent:${id}`;
+    const actorId = `agent:${id}` as const;
+    this.rooms.cancelAgent(actorId);
     for (const turn of this.turns) {
       if (turn.agents.has(actorId)) turn.controller.abort(new EngineError('AGENT_STOPPED', 'Agent was stopped', 409));
     }
@@ -84,6 +114,7 @@ export class AgentEngine {
     }
   }
 
+  /** Create a conversation with immutable participants (agents must already be registered). */
   createConversation(participants: ActorId[]): Conversation {
     this.assertOpen();
     if (!Array.isArray(participants) || participants.length < 2 || participants.length > 100) invalid('A conversation needs 2 to 100 participants');
@@ -97,17 +128,21 @@ export class AgentEngine {
 
   getConversation(id: string): Conversation { return structuredClone(this.conversation(id)); }
 
+  /** Send as the fixed local owner principal `user:local-user`. */
   sendUserMessage(input: SendInput): Promise<SendResult> {
     return this.enqueue('user:local-user', input);
   }
 
+  /** Trusted in-process send as a registered agent (not exposed over HTTP). */
   sendAgentMessage(id: string, input: SendInput): Promise<SendResult> {
     return this.enqueue(`agent:${identifier(id)}`, input);
   }
 
+  /** Abort open turns and stop agents. Transcripts remain until process exit. */
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.rooms.close();
     for (const turn of this.turns) turn.controller.abort(new EngineError('CLOSED', 'Engine is closed', 503));
     await Promise.allSettled([...this.agents.keys()].filter((id) => this.instance(id).status !== 'loading').map((id) => this.stopAgent(id)));
   }
@@ -125,6 +160,7 @@ export class AgentEngine {
         return structuredClone(await replay.result);
       }
     }
+    // Chain onto the prior root for this conversation; nested sends run inside the same turn.
     const previous = this.queues.get(input.conversationId) ?? Promise.resolve();
     const result = previous.catch(() => {}).then(async () => {
       this.assertOpen();
@@ -136,6 +172,7 @@ export class AgentEngine {
         return await this.dispatch(from, input, turn, from.startsWith('agent:') ? [from] : []);
       } finally {
         clearTimeout(timer);
+        // Invalidate late nested sends after the root turn completes.
         turn.controller.abort(new EngineError('TURN_FINISHED', 'Message turn has finished', 409));
         this.turns.delete(turn);
       }

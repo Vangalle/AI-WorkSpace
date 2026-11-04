@@ -5,7 +5,9 @@ import type { ActorId, AgentConfig, AgentRuntime, AgentRuntimeFactory, Message, 
 import { checkSignal, EngineError } from '../errors.js';
 import { actor, agentConfig } from '../validation.js';
 import { piResources } from './pi-resources.js';
+import { createPiRoomObserver } from './pi-room.js';
 
+/** Explicit credential/model file locations; network model refresh is disabled. */
 export interface PiRuntimeOptions {
   cwd?: string;
   agentDir?: string;
@@ -13,6 +15,10 @@ export interface PiRuntimeOptions {
   authPath?: string;
 }
 
+/**
+ * Pi SDK adapter: one in-memory session per conversation, custom `send_message` tool,
+ * no shell/file tools, and failed inference discards the session instead of reusing ambiguous history.
+ */
 export class PiRuntimeFactory implements AgentRuntimeFactory {
   private readonly cwd: string;
   private readonly agentDir: string;
@@ -37,6 +43,7 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
       if (!key?.trim()) throw new EngineError('MISSING_CREDENTIALS', 'Configured credential environment variable is empty', 400);
       await modelRuntime.setRuntimeApiKey(config.model.provider, key);
     }
+    const roomObserver = createPiRoomObserver(config, { cwd: this.cwd, agentDir: this.agentDir, model, modelRuntime });
     const sessions = new Map<string, { session: AgentSession; active?: RuntimeContext }>();
     let disposed = false;
 
@@ -75,6 +82,7 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
     };
 
     return {
+      observe: (input, context) => roomObserver.observe(input, context),
       receive: async (message: Readonly<Message>, context: RuntimeContext): Promise<string> => {
         if (disposed) throw new EngineError('AGENT_STOPPED', 'Agent was stopped', 409);
         checkSignal(context.signal);
@@ -83,6 +91,7 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
         if (entry.active) throw new EngineError('AGENT_BUSY', 'Session is processing another message', 409);
         entry.active = context;
         const cancel = () => {
+          // Drop the session on abort so a late model completion cannot reuse stale context.
           if (sessions.get(message.conversationId) === entry) sessions.delete(message.conversationId);
           delete entry.active;
           void entry.session.abort().catch(() => {});
@@ -113,6 +122,7 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
       },
       dispose: async () => {
         disposed = true;
+        roomObserver.dispose();
         for (const { session } of sessions.values()) session.dispose();
         sessions.clear();
       },

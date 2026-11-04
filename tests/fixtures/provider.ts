@@ -10,6 +10,12 @@ export interface ProviderRequest {
   tools?: Array<{ function: { name: string } }>;
 }
 
+export function providerText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map((part) => typeof part?.text === 'string' ? part.text : '').join('');
+  return JSON.stringify(content);
+}
+
 export async function fixtureProvider(options: { beforeReply?: (request: ProviderRequest) => Promise<void> } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'agent-im-'));
   const requests: ProviderRequest[] = [];
@@ -21,7 +27,7 @@ export async function fixtureProvider(options: { beforeReply?: (request: Provide
     await options.beforeReply?.(input);
     if (response.destroyed) return;
     const last = input.messages.at(-1);
-    const content = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content);
+    const content = providerText(last?.content);
     if (content.includes('provider-failure')) {
       response.writeHead(401, { 'content-type': 'application/json' });
       response.end(JSON.stringify({ error: { message: 'secret-provider-error', type: 'authentication_error' } }));
@@ -34,7 +40,18 @@ export async function fixtureProvider(options: { beforeReply?: (request: Provide
       response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: input.model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
     };
     chunk({ role: 'assistant' });
-    if (toolCall) {
+    const roomMode = input.tools?.some((tool) => tool.function.name === 'room_action') && last?.role === 'user';
+    const roomInput = roomMode ? JSON.parse(content) as { messages: Array<{ id: string; text: string }>; pendingMessageIds: string[] } : undefined;
+    const pendingContent = roomInput?.messages.filter((m) => roomInput.pendingMessageIds.includes(m.id)).map((m) => m.text).join('\n') ?? '';
+    if (roomMode && !pendingContent.includes('room-raw')) {
+      const args = pendingContent.includes('room-invalid') ? { action: 'reply', text: '' }
+        : pendingContent.includes('room-silent') ? { action: 'silent' }
+        : { action: 'reply', text: 'room fixture reply' };
+      const calls = [{ index: 0, id: 'room-call', type: 'function', function: { name: 'room_action', arguments: JSON.stringify(args) } }];
+      if (pendingContent.includes('room-multiple')) calls.push({ ...calls[0]!, index: 1, id: 'room-call-2' });
+      chunk({ tool_calls: calls });
+      chunk({}, 'tool_calls');
+    } else if (toolCall) {
       chunk({ tool_calls: [{ index: 0, id: 'call-fixture', type: 'function', function: { name: 'send_message', arguments: JSON.stringify({ to: 'agent:b', text: 'fixture question' }) } }] });
       chunk({}, 'tool_calls');
     } else {

@@ -1,34 +1,41 @@
 import type { ActorId, AgentConfig, SendInput } from './agent.js';
 import { EngineError } from './errors.js';
 
+/** Fail validation with a stable INVALID_INPUT error. */
 export function invalid(message: string): never {
   throw new EngineError('INVALID_INPUT', message);
 }
 
+/** Require a plain object (not null/array). */
 export function object(value: unknown, label = 'body'): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) invalid(`${label} must be an object`);
   return value as Record<string, unknown>;
 }
 
+/** Reject unexpected fields so configs cannot smuggle extra keys. */
 export function onlyKeys(value: Record<string, unknown>, keys: string[]): void {
   if (Object.keys(value).some((key) => !keys.includes(key))) invalid('Unknown input field');
 }
 
+/** Nonempty trimmed string within a max length. */
 export function text(value: unknown, label: string, max = 32_000): string {
   if (typeof value !== 'string' || !value.trim() || value.length > max) invalid(`${label} must be nonempty text (max ${max} characters)`);
   return value;
 }
 
+/** Identifier used for agents, conversations, and clientIds. */
 export function identifier(value: unknown, label = 'id'): string {
   if (typeof value !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(value)) invalid(`${label} is invalid`);
   return value;
 }
 
+/** Parse `user:…` / `agent:…` participant IDs. */
 export function actor(value: unknown): ActorId {
   if (typeof value !== 'string' || !/^(user|agent):[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(value)) invalid('Invalid participant ID');
   return value as ActorId;
 }
 
+/** Validate and normalize AgentConfig; only the `pi` runtime is accepted. */
 export function agentConfig(value: unknown): AgentConfig {
   const input = object(value);
   onlyKeys(input, ['id', 'runtime', 'model', 'systemPrompt', 'allowSendTo']);
@@ -54,6 +61,7 @@ export function agentConfig(value: unknown): AgentConfig {
   };
 }
 
+/** Validate a user/agent send payload. */
 export function sendInput(value: unknown): SendInput {
   const input = object(value);
   onlyKeys(input, ['conversationId', 'to', 'text', 'clientId']);

@@ -1,3 +1,4 @@
+/** CLI one-shot chat: load agent JSON configs, send one user message, print the reply. */
 import { readFile } from 'node:fs/promises';
 import { AgentEngine } from './engine.js';
 import { EngineError, safeError } from './errors.js';

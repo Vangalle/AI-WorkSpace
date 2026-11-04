@@ -1,44 +1,23 @@
-import { timingSafeEqual } from 'node:crypto';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer } from 'node:http';
 import type { ActorId } from './agent.js';
 import type { AgentEngine } from './engine.js';
 import { EngineError, safeError } from './errors.js';
 import { actor, agentConfig, invalid, object, onlyKeys, sendInput } from './validation.js';
 
-function json(response: ServerResponse, status: number, body: unknown): void {
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
-  response.end(JSON.stringify(body));
-}
+import { serverCredentials, type EngineServerOptions } from './http-auth.js';
+import { json, readJson } from './http-io.js';
+import { roomRoute } from './rooms/http.js';
 
-function readJson(request: IncomingMessage): Promise<unknown> {
-  if (!/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] ?? '')) throw new EngineError('CONTENT_TYPE', 'Use application/json', 415);
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks: Buffer[] = [];
-    request.on('data', (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > 131072) {
-        chunks.length = 0;
-        reject(new EngineError('BODY_TOO_LARGE', 'JSON body exceeds 128 KiB', 413));
-      } else chunks.push(chunk);
-    });
-    request.on('end', () => {
-      if (size > 131072) return;
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
-      catch { reject(new EngineError('INVALID_INPUT', 'Invalid JSON body')); }
-    });
-    request.on('error', () => reject(new EngineError('INVALID_INPUT', 'Could not read request body')));
-    request.on('aborted', () => reject(new EngineError('INVALID_INPUT', 'Request was aborted')));
-  });
-}
-
-export function createEngineServer(engine: AgentEngine, options: { token: string }) {
-  if (typeof options.token !== 'string' || options.token.trim().length < 24 || options.token.length > 256 || /\s/.test(options.token)) invalid('HTTP token must be 24 to 256 non-whitespace characters');
-  const authorization = Buffer.from(`Bearer ${options.token}`);
+/**
+ * Legacy endpoints remain admin-only; room endpoints derive user identity from credentials.
+ * Sender IDs are never accepted from request bodies.
+ */
+export function createEngineServer(engine: AgentEngine, options: EngineServerOptions) {
+  const credentials = serverCredentials(options);
   const server = createServer({ maxHeaderSize: 16384 }, (request, response) => {
     void (async () => {
-      const provided = Buffer.from(request.headers.authorization ?? '');
-      if (provided.length !== authorization.length || !timingSafeEqual(provided, authorization)) {
+      const principal = credentials.authenticate(request.headers.authorization);
+      if (!principal) {
         request.resume();
         response.setHeader('www-authenticate', 'Bearer');
         json(response, 401, { error: { code: 'UNAUTHORIZED', message: 'Bearer token required' } });
@@ -51,8 +30,15 @@ export function createEngineServer(engine: AgentEngine, options: { token: string
       if (!['GET', 'POST'].includes(method)) throw new EngineError('METHOD_NOT_ALLOWED', 'Use GET or POST', 405);
       const [resource, id, action] = path;
       if (resource === 'health' && path.length === 1 && method === 'GET') {
-        json(response, 200, { status: 'ok', storage: 'memory', principal: 'user:local-user' });
-      } else if (resource === 'agents' && path.length === 1) {
+        json(response, 200, { status: 'ok', storage: 'memory', principal: principal.id });
+        return;
+      }
+      if (resource === 'rooms') {
+        await roomRoute(engine, path, principal, credentials.knownUsers, request, response);
+        return;
+      }
+      if (!principal.admin) throw new EngineError('FORBIDDEN', 'This endpoint requires the admin credential', 403);
+      if (resource === 'agents' && path.length === 1) {
         if (method === 'GET') json(response, 200, engine.listAgents());
         else json(response, 201, engine.registerAgent(agentConfig(await readJson(request))));
       } else if (resource === 'agents' && id && path.length === 2 && method === 'GET') {

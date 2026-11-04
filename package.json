@@ -10,6 +10,7 @@
   "scripts": {
     "dev": "tsx src/main.ts",
     "chat": "tsx src/chat.ts",
+    "room-chat": "node examples/room-chat.mjs",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
