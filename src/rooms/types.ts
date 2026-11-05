@@ -40,6 +40,7 @@ export interface RoomActivity {
 
 export interface Room {
   id: string;
+  status: 'open' | 'closed';
   /**
    * Latest retained event seq in this process;
    * subscribe with `after: eventCursor` to continue without gaps after a snapshot.

@@ -1,5 +1,4 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { AgentEngine } from '../engine.js';
 import { EngineError } from '../errors.js';
 import type { HttpPrincipal } from '../http-auth.js';
 import { json, readJson } from '../http-io.js';
@@ -79,7 +78,7 @@ function events(
  * admins may create rooms for others. Reading and posting still require membership.
  */
 export async function roomRoute(
-  engine: AgentEngine,
+  rooms: ChatRooms,
   path: string[],
   principal: HttpPrincipal,
   knownUsers: Set<UserId>,
@@ -97,20 +96,24 @@ export async function roomRoute(
       throw new EngineError('FORBIDDEN', 'Room must include the authenticated user', 403);
     if (participants.some((id) => id.startsWith('user:') && !knownUsers.has(id as UserId)))
       invalid('Room contains an unconfigured user');
-    json(response, 201, engine.rooms.create(participants));
+    json(response, 201, rooms.create(participants));
   } else if (path.length === 1 && method === 'GET') {
-    json(response, 200, engine.rooms.list(principal.id));
+    json(response, 200, rooms.list(principal.id));
   } else if (id && path.length === 2 && method === 'GET') {
-    json(response, 200, engine.rooms.get(id, principal.id));
+    json(response, 200, rooms.get(id, principal.id));
+  } else if (id && path.length === 3 && action === 'close' && method === 'POST') {
+    request.resume();
+    rooms.closeRoom(id, principal.id);
+    json(response, 200, rooms.get(id, principal.id));
   } else if (id && path.length === 3 && action === 'messages' && method === 'POST') {
     // Reject nonmembers before reading the body;
     // admission rechecks membership rather than trusting call order.
-    engine.rooms.get(id, principal.id);
-    json(response, 201, engine.rooms.post(id, principal.id, (await readJson(request)) as RoomPost));
+    rooms.get(id, principal.id);
+    json(response, 201, rooms.post(id, principal.id, (await readJson(request)) as RoomPost));
   } else if (id && path.length === 3 && action === 'messages' && method === 'GET') {
-    json(response, 200, engine.rooms.get(id, principal.id).messages);
+    json(response, 200, rooms.get(id, principal.id).messages);
   } else if (id && path.length === 3 && action === 'events' && method === 'GET') {
-    events(engine.rooms, id, principal.id, request, response);
+    events(rooms, id, principal.id, request, response);
   } else {
     throw new EngineError('NOT_FOUND', 'Route not found', 404);
   }

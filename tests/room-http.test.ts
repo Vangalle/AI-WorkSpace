@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { spawn } from 'node:child_process';
 import { test } from 'node:test';
-import { AgentEngine } from '../src/engine.js';
-import { createEngineServer } from '../src/http.js';
+import { ChatApplication } from '../src/application.js';
+import { createChatServer } from '../src/http.js';
 import { config, deferred } from './helpers.js';
 import type { Room, RoomEvent } from '../src/rooms/types.js';
 
@@ -13,7 +13,7 @@ const bob = 'bob-test-token-12345678901234567';
 const outsider = 'outsider-token-12345678901234567';
 
 async function setup(
-  engine = new AgentEngine(
+  app = new ChatApplication(
     {
       load: async () => ({
         receive: async () => 'direct',
@@ -24,9 +24,9 @@ async function setup(
     { roomDebounceMs: 0 },
   ),
 ) {
-  engine.registerAgent(config('a'));
-  await engine.startAgent('a');
-  const server = createEngineServer(engine, {
+  app.agents.registerAgent(config('a'));
+  await app.agents.startAgent('a');
+  const server = createChatServer(app, {
     token: admin,
     userTokens: { 'user:alice': alice, 'user:bob': bob, 'user:outsider': outsider },
   });
@@ -42,7 +42,7 @@ async function setup(
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
   const close = async () => {
-    await engine.close();
+    await app.close();
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
@@ -54,7 +54,7 @@ async function setup(
   if (created.status !== 201) await close();
   assert.equal(created.status, 201);
   const room = (await created.json()) as Room;
-  return { engine, server, base, request, room, close };
+  return { app, server, base, request, room, close };
 }
 
 async function nextEvent(
@@ -108,6 +108,30 @@ test('HTTP room supports independent humans without granting legacy admin permis
   );
 });
 
+test('HTTP closes only the selected room, preserves its history and keeps agents running', async (t) => {
+  const { app, room, request, close } = await setup();
+  t.after(close);
+  assert.equal(room.status, 'open');
+  await request(alice, `/rooms/${room.id}/messages`, 'POST', { text: 'retained' });
+  assert.equal((await request(outsider, `/rooms/${room.id}/close`, 'POST')).status, 403);
+  assert.equal((await request(alice, `/rooms/${room.id}/close`, 'POST')).status, 200);
+  assert.equal((await request(alice, `/rooms/${room.id}/close`, 'POST')).status, 200);
+  const view = (await (await request(bob, `/rooms/${room.id}`)).json()) as Room;
+  assert.equal(view.status, 'closed');
+  assert.equal(view.messages[0]?.text, 'retained');
+  assert.equal(
+    (await request(alice, `/rooms/${room.id}/messages`, 'POST', { text: 'too late' })).status,
+    409,
+  );
+  assert.equal((await request(alice, `/rooms/${room.id}/events`)).status, 409);
+  assert.equal(app.agents.getAgent('a').status, 'running');
+  const second = app.rooms.create(['user:alice', 'agent:a']);
+  assert.equal(
+    (await request(alice, `/rooms/${second.id}/messages`, 'POST', { text: 'still open' })).status,
+    201,
+  );
+});
+
 test('HTTP denies outsiders, spoofed senders and unconfigured human identities', async (t) => {
   const { request, room, close } = await setup();
   t.after(close);
@@ -143,7 +167,7 @@ test('HTTP denies outsiders, spoofed senders and unconfigured human identities',
 test('HTTP immediately admits @ commands while the agent is still thinking', async (t) => {
   const entered = deferred<void>();
   const release = deferred<void>();
-  const engine = new AgentEngine(
+  const app = new ChatApplication(
     {
       load: async () => ({
         receive: async () => 'direct',
@@ -157,7 +181,7 @@ test('HTTP immediately admits @ commands while the agent is still thinking', asy
     },
     { roomDebounceMs: 0 },
   );
-  const service = await setup(engine);
+  const service = await setup(app);
   t.after(async () => {
     release.resolve();
     await service.close();
@@ -212,7 +236,7 @@ test('authenticated SSE replays and follows room messages with a resumable event
 });
 
 test('server rejects duplicate, weak or non-user credentials', () => {
-  const engine = new AgentEngine({
+  const app = new ChatApplication({
     load: async () => {
       throw new Error('unused');
     },
@@ -223,7 +247,7 @@ test('server rejects duplicate, weak or non-user credentials', () => {
     { 'agent:a': alice },
     { 'user:alice': alice, 'user:bob': alice },
   ]) {
-    assert.throws(() => createEngineServer(engine, { token: admin, userTokens }), {
+    assert.throws(() => createChatServer(app, { token: admin, userTokens }), {
       code: 'INVALID_INPUT',
     });
   }

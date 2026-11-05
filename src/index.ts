@@ -1,5 +1,9 @@
 /** Public library exports for embedding the engine without the HTTP entrypoint. */
 export { AgentEngine } from './engine.js';
+export type { AgentAccess } from './agent-access.js';
+export { ChatApplication } from './application.js';
+export type { ChatApplicationOptions } from './application.js';
+export { Conversations } from './conversations.js';
 export { ChatRooms } from './rooms/chat-rooms.js';
 export type { RoomOptions } from './rooms/chat-rooms.js';
 export type {
@@ -17,7 +21,7 @@ export type {
 export { EngineError } from './errors.js';
 export { PiRuntimeFactory } from './runtime/pi.js';
 export type { PiRuntimeOptions } from './runtime/pi.js';
-export { createEngineServer } from './http.js';
+export { createChatServer } from './http.js';
 export type { EngineServerOptions } from './http-auth.js';
 export type {
   ActorId,
@@ -25,10 +29,12 @@ export type {
   AgentRuntime,
   AgentRuntimeFactory,
   AgentView,
-  Conversation,
   Failure,
+} from './agent.js';
+export type {
+  Conversation,
   Message,
   RuntimeContext,
   SendInput,
   SendResult,
-} from './agent.js';
+} from './conversation-types.js';

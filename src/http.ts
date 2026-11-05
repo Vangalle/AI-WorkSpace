@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import type { ActorId } from './agent.js';
-import type { AgentEngine } from './engine.js';
+import type { ChatApplication } from './application.js';
 import { EngineError, safeError } from './errors.js';
 import { actor, agentConfig, invalid, object, onlyKeys, sendInput } from './validation.js';
 
@@ -9,12 +9,13 @@ import { json, readJson } from './http-io.js';
 import { roomRoute } from './rooms/http.js';
 
 /**
- * Loopback HTTP adapter: authenticate, map credentials to principals, and call the engine.
+ * Loopback HTTP adapter: authenticate and route to independent agent, room and conversation services.
  * Directed conversation/message routes stay admin-only (`user:local-user`).
  * Room routes accept distinct user tokens, still subject to room membership.
  * Sender identity comes only from authentication, never from request bodies.
  */
-export function createEngineServer(engine: AgentEngine, options: EngineServerOptions) {
+export function createChatServer(app: ChatApplication, options: EngineServerOptions) {
+  const { agents: engine, rooms, conversations } = app;
   const credentials = serverCredentials(options);
   const server = createServer({ maxHeaderSize: 16384 }, (request, response) => {
     void (async () => {
@@ -44,7 +45,7 @@ export function createEngineServer(engine: AgentEngine, options: EngineServerOpt
         return;
       }
       if (resource === 'rooms') {
-        await roomRoute(engine, path, principal, credentials.knownUsers, request, response);
+        await roomRoute(rooms, path, principal, credentials.knownUsers, request, response);
         return;
       }
       if (!principal.admin)
@@ -86,19 +87,23 @@ export function createEngineServer(engine: AgentEngine, options: EngineServerOpt
             'This single-owner service only supports user:local-user',
             403,
           );
-        json(response, 201, engine.createConversation(participants));
+        json(response, 201, conversations.createConversation(participants));
       } else if (
         resource === 'conversations' &&
         id &&
         method === 'GET' &&
         (path.length === 2 || (path.length === 3 && action === 'messages'))
       ) {
-        const conversation = engine.getConversation(id);
+        const conversation = conversations.getConversation(id);
         if (!conversation.participants.includes('user:local-user'))
           throw new EngineError('FORBIDDEN', 'Conversation is not accessible', 403);
         json(response, 200, action === 'messages' ? conversation.messages : conversation);
       } else if (resource === 'messages' && path.length === 1 && method === 'POST') {
-        json(response, 200, await engine.sendUserMessage(sendInput(await readJson(request))));
+        json(
+          response,
+          200,
+          await conversations.sendUserMessage(sendInput(await readJson(request))),
+        );
       } else {
         request.resume();
         throw new EngineError('NOT_FOUND', 'Route not found', 404);

@@ -1,16 +1,16 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { test } from 'node:test';
-import { AgentEngine } from '../src/engine.js';
-import { createEngineServer } from '../src/http.js';
+import { ChatApplication } from '../src/application.js';
+import { createChatServer } from '../src/http.js';
 import { PiRuntimeFactory } from '../src/runtime/pi.js';
 import { config, TestRuntimeFactory } from './helpers.js';
 import { fixtureProvider } from './fixtures/provider.js';
 
 const token = 'integration-test-token-1234567890';
 
-async function serve(engine = new AgentEngine(new TestRuntimeFactory())) {
-  const server = createEngineServer(engine, { token });
+async function serve(app = new ChatApplication(new TestRuntimeFactory())) {
+  const server = createChatServer(app, { token });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const address = server.address();
@@ -26,7 +26,7 @@ async function serve(engine = new AgentEngine(new TestRuntimeFactory())) {
       });
     },
     async close() {
-      await engine.close();
+      await app.close();
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
@@ -51,7 +51,7 @@ test('http requires bearer authentication on all routes and rejects weak server 
     principal: 'user:local-user',
   });
   assert.throws(
-    () => createEngineServer(new AgentEngine(new TestRuntimeFactory()), { token: '' }),
+    () => createChatServer(new ChatApplication(new TestRuntimeFactory()), { token: '' }),
     { code: 'INVALID_INPUT' },
   );
 });
@@ -139,12 +139,12 @@ test('http rejects spoofed identities, malformed input, oversized bodies and unk
 });
 
 test('http maps lifecycle errors and preserves failed message status', async (t) => {
-  const engine = new AgentEngine({
+  const app = new ChatApplication({
     load: async () => {
       throw new Error('secret-provider-key');
     },
   });
-  const service = await serve(engine);
+  const service = await serve(app);
   t.after(() => service.close());
   await service.request('/agents', 'POST', config());
   const failed = await service.request('/agents/a/start', 'POST');
@@ -168,14 +168,14 @@ test('http maps lifecycle errors and preserves failed message status', async (t)
 
 test('http integrates real Pi SDK against local protocol fixture end-to-end', async (t) => {
   const fixture = await fixtureProvider();
-  const engine = new AgentEngine(
+  const app = new ChatApplication(
     new PiRuntimeFactory({
       cwd: fixture.directory,
       agentDir: fixture.directory,
       modelsPath: fixture.modelsPath,
     }),
   );
-  const service = await serve(engine);
+  const service = await serve(app);
   t.after(async () => {
     await service.close();
     await fixture.close();

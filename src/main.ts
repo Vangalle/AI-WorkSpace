@@ -1,7 +1,7 @@
-/** Loopback HTTP entry: Pi factory + AgentEngine, bearer token printed on listen. */
+/** Composition root: independent agent, conversation and room services exposed over loopback HTTP. */
 import { randomBytes } from 'node:crypto';
-import { AgentEngine } from './engine.js';
-import { createEngineServer } from './http.js';
+import { ChatApplication } from './application.js';
+import { createChatServer } from './http.js';
 import { PiRuntimeFactory } from './runtime/pi.js';
 
 const rawPort = process.env.PORT ?? '3000';
@@ -12,7 +12,7 @@ const factory = new PiRuntimeFactory({
   ...(process.env.ENGINE_MODELS_PATH ? { modelsPath: process.env.ENGINE_MODELS_PATH } : {}),
   ...(process.env.ENGINE_AUTH_PATH ? { authPath: process.env.ENGINE_AUTH_PATH } : {}),
 });
-const engine = new AgentEngine(factory);
+const app = new ChatApplication(factory);
 let userTokens: Record<string, string> | undefined;
 if (process.env.ENGINE_USER_TOKENS !== undefined) {
   try {
@@ -21,7 +21,7 @@ if (process.env.ENGINE_USER_TOKENS !== undefined) {
     throw new Error('ENGINE_USER_TOKENS must be a JSON object mapping user IDs to tokens');
   }
 }
-const server = createEngineServer(engine, {
+const server = createChatServer(app, {
   token,
   ...(userTokens === undefined ? {} : { userTokens }),
 });
@@ -31,9 +31,12 @@ const reportShutdownFailure = () => {
 };
 server.on('error', (error: NodeJS.ErrnoException) => {
   console.error(`HTTP server failed: ${error.code ?? 'UNKNOWN'}`);
-  void engine.close().catch(reportShutdownFailure).finally(() => {
-    process.exitCode = 1;
-  });
+  void app
+    .close()
+    .catch(reportShutdownFailure)
+    .finally(() => {
+      process.exitCode = 1;
+    });
 });
 server.listen(Number(rawPort), '127.0.0.1', () => {
   const address = server.address();
@@ -42,7 +45,7 @@ server.listen(Number(rawPort), '127.0.0.1', () => {
     console.log(`Bearer token: ${token}`);
     console.log('Storage: memory only; no agents loaded. POST /agents to configure one.');
     console.log(
-      'Shared chat: POST /rooms, then npm run room-chat -- <room-id>. @agent-id sends a command.',
+      'Shared chat: POST /rooms, then npm run chat -- <room-id>. @agent-id sends a command.',
     );
   }
 });
@@ -50,10 +53,13 @@ let stopping = false;
 const shutdown = () => {
   if (stopping) return;
   stopping = true;
-  // Stop accepting connections, let the engine abort inference and close SSE,
+  // Stop accepting connections, close communication services and agent runtimes,
   // then clean up remaining sockets.
   server.close();
-  void engine.close().catch(reportShutdownFailure).finally(() => server.closeAllConnections());
+  void app
+    .close()
+    .catch(reportShutdownFailure)
+    .finally(() => server.closeAllConnections());
 };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

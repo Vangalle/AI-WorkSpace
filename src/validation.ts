@@ -1,4 +1,5 @@
-import type { ActorId, AgentConfig, SendInput } from './agent.js';
+import type { ActorId, AgentConfig } from './agent.js';
+import type { SendInput } from './conversation-types.js';
 import { EngineError } from './errors.js';
 
 /** Fail validation with a stable INVALID_INPUT error. */

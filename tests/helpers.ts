@@ -1,10 +1,5 @@
-import type {
-  AgentConfig,
-  AgentRuntime,
-  AgentRuntimeFactory,
-  Message,
-  RuntimeContext,
-} from '../src/agent.js';
+import type { AgentConfig, AgentRuntime, AgentRuntimeFactory } from '../src/agent.js';
+import type { Message, RuntimeContext } from '../src/conversation-types.js';
 
 export function config(id = 'a', overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {

@@ -1,4 +1,5 @@
 import type { RoomDecision, RoomObservation, RoomObserverContext } from './rooms/types.js';
+import type { Message, RuntimeContext } from './conversation-types.js';
 
 /** Stable participant identity: a user or a registered agent. */
 export type ActorId = `user:${string}` | `agent:${string}`;
@@ -31,55 +32,6 @@ export interface AgentView {
   config: AgentConfig;
   status: 'stopped' | 'loading' | 'running' | 'stopping' | 'start_failed' | 'stop_failed';
   error?: Failure;
-}
-
-/**
- * One IM-neutral message in a conversation transcript.
- * Status progresses accepted → processing → completed|failed for agent recipients,
- * or accepted → delivered for user recipients.
- */
-export interface Message {
-  id: string;
-  conversationId: string;
-  from: ActorId;
-  to: ActorId;
-  text: string;
-  createdAt: string;
-  replyTo?: string;
-  status: 'accepted' | 'processing' | 'delivered' | 'completed' | 'failed';
-  error?: Failure;
-}
-
-/** Conversation with immutable participants and in-memory transcript. */
-export interface Conversation {
-  id: string;
-  participants: ActorId[];
-  messages: Message[];
-}
-
-/** Outbound send request. Optional `clientId` enables sender/conversation idempotent replay. */
-export interface SendInput {
-  conversationId: string;
-  to: ActorId;
-  text: string;
-  clientId?: string;
-}
-
-/** Result of a send: the recorded outbound message and optional agent reply. */
-export interface SendResult {
-  message: Message;
-  reply?: Message;
-}
-
-/**
- * Capabilities bound to the active directed turn.
- * Nested `send` waits for agent replies; those replies are recorded but do not
- * start another inference on the caller.
- */
-export interface RuntimeContext {
-  signal: AbortSignal;
-  participants: readonly ActorId[];
-  send(to: ActorId, text: string): Promise<SendResult>;
 }
 
 /**

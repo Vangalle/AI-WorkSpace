@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AgentEngine } from '../src/engine.js';
+import { ChatApplication } from '../src/application.js';
 import { PiRuntimeFactory } from '../src/runtime/pi.js';
 import { config, deferred } from './helpers.js';
 import { fixtureProvider } from './fixtures/provider.js';
@@ -12,20 +12,24 @@ async function setup() {
     agentDir: fixture.directory,
     modelsPath: fixture.modelsPath,
   });
-  const engine = new AgentEngine(factory, { timeoutMs: 5000 });
+  const app = new ChatApplication(factory, { timeoutMs: 5000 });
   const model = { provider: 'fixture', id: 'fixture-model' };
-  engine.registerAgent(config('a', { model }));
-  engine.registerAgent(config('b', { model }));
-  await engine.startAgent('a');
-  await engine.startAgent('b');
-  const conversation = engine.createConversation(['user:local-user', 'agent:a', 'agent:b']);
+  app.agents.registerAgent(config('a', { model }));
+  app.agents.registerAgent(config('b', { model }));
+  await app.agents.startAgent('a');
+  await app.agents.startAgent('b');
+  const conversation = app.conversations.createConversation([
+    'user:local-user',
+    'agent:a',
+    'agent:b',
+  ]);
   return {
     fixture,
     factory,
-    engine,
+    app,
     conversationId: conversation.id,
     async close() {
-      await engine.close();
+      await app.close();
       await fixture.close();
     },
   };
@@ -34,9 +38,13 @@ async function setup() {
 test('pi uses real SDK with selected model, replaced prompt and communication-only tools', async (t) => {
   const setupResult = await setup();
   t.after(() => setupResult.close());
-  const { engine, fixture, conversationId } = setupResult;
+  const { app, fixture, conversationId } = setupResult;
   assert.equal(fixture.requests.length, 0);
-  const result = await engine.sendUserMessage({ conversationId, to: 'agent:a', text: 'hello' });
+  const result = await app.conversations.sendUserMessage({
+    conversationId,
+    to: 'agent:a',
+    text: 'hello',
+  });
   assert.equal(result.reply?.text, 'fixture answer');
   assert.equal(fixture.requests[0]?.model, 'fixture-model');
   const system = JSON.stringify(fixture.requests[0]?.messages[0]?.content);
@@ -52,7 +60,7 @@ test('pi uses real SDK with selected model, replaced prompt and communication-on
 test('pi real SDK tool protocol completes A→B delegation', async (t) => {
   const result = await setup();
   t.after(() => result.close());
-  const sent = await result.engine.sendUserMessage({
+  const sent = await result.app.conversations.sendUserMessage({
     conversationId: result.conversationId,
     to: 'agent:a',
     text: 'delegate',
@@ -61,7 +69,9 @@ test('pi real SDK tool protocol completes A→B delegation', async (t) => {
   assert.equal(sent.reply?.text, 'A concludes: fixture answer');
   assert.equal(result.fixture.requests.length, 3);
   assert.deepEqual(
-    result.engine.getConversation(result.conversationId).messages.map((message) => message.text),
+    result.app.conversations
+      .getConversation(result.conversationId)
+      .messages.map((message) => message.text),
     ['delegate', 'fixture question', 'fixture answer', 'A concludes: fixture answer'],
   );
   assert.ok(
@@ -75,15 +85,18 @@ test('pi real SDK tool protocol completes A→B delegation', async (t) => {
 test('pi keeps conversation SDK history separate and supports append prompt mode', async (t) => {
   const result = await setup();
   t.after(() => result.close());
-  result.engine.registerAgent(
+  result.app.agents.registerAgent(
     config('append', {
       model: { provider: 'fixture', id: 'fixture-model' },
       systemPrompt: { mode: 'append', text: 'APPENDED-INSTRUCTION' },
     }),
   );
-  await result.engine.startAgent('append');
-  const appended = result.engine.createConversation(['user:local-user', 'agent:append']);
-  await result.engine.sendUserMessage({
+  await result.app.agents.startAgent('append');
+  const appended = result.app.conversations.createConversation([
+    'user:local-user',
+    'agent:append',
+  ]);
+  await result.app.conversations.sendUserMessage({
     conversationId: appended.id,
     to: 'agent:append',
     text: 'hi',
@@ -91,13 +104,13 @@ test('pi keeps conversation SDK history separate and supports append prompt mode
   const system = JSON.stringify(result.fixture.requests[0]?.messages[0]?.content);
   assert.match(system, /APPENDED-INSTRUCTION/);
   assert.match(system, /coding assistant/);
-  await result.engine.sendUserMessage({
+  await result.app.conversations.sendUserMessage({
     conversationId: result.conversationId,
     to: 'agent:a',
     text: 'private-one',
   });
-  const other = result.engine.createConversation(['user:local-user', 'agent:a']);
-  await result.engine.sendUserMessage({
+  const other = result.app.conversations.createConversation(['user:local-user', 'agent:a']);
+  await result.app.conversations.sendUserMessage({
     conversationId: other.id,
     to: 'agent:a',
     text: 'private-two',
@@ -108,12 +121,12 @@ test('pi keeps conversation SDK history separate and supports append prompt mode
 test('pi recognizes SDK provider errors instead of returning an old successful response', async (t) => {
   const result = await setup();
   t.after(() => result.close());
-  await result.engine.sendUserMessage({
+  await result.app.conversations.sendUserMessage({
     conversationId: result.conversationId,
     to: 'agent:a',
     text: 'first',
   });
-  const failed = await result.engine.sendUserMessage({
+  const failed = await result.app.conversations.sendUserMessage({
     conversationId: result.conversationId,
     to: 'agent:a',
     text: 'provider-failure',
@@ -122,7 +135,7 @@ test('pi recognizes SDK provider errors instead of returning an old successful r
   assert.equal(failed.message.error?.code, 'MODEL_ERROR');
   assert.equal(failed.reply, undefined);
   assert.doesNotMatch(JSON.stringify(failed), /secret-provider-error/);
-  const recovered = await result.engine.sendUserMessage({
+  const recovered = await result.app.conversations.sendUserMessage({
     conversationId: result.conversationId,
     to: 'agent:a',
     text: 'recovered',
@@ -142,7 +155,7 @@ test('pi replaces a timed-out session before the next queued message and rejects
       }
     },
   });
-  const engine = new AgentEngine(
+  const app = new ChatApplication(
     new PiRuntimeFactory({
       cwd: fixture.directory,
       agentDir: fixture.directory,
@@ -152,13 +165,13 @@ test('pi replaces a timed-out session before the next queued message and rejects
   );
   t.after(async () => {
     release.resolve();
-    await engine.close();
+    await app.close();
     await fixture.close();
   });
-  engine.registerAgent(config('a', { model: { provider: 'fixture', id: 'fixture-model' } }));
-  await engine.startAgent('a');
-  const conversation = engine.createConversation(['user:local-user', 'agent:a']);
-  const first = engine.sendUserMessage({
+  app.agents.registerAgent(config('a', { model: { provider: 'fixture', id: 'fixture-model' } }));
+  await app.agents.startAgent('a');
+  const conversation = app.conversations.createConversation(['user:local-user', 'agent:a']);
+  const first = app.conversations.sendUserMessage({
     conversationId: conversation.id,
     to: 'agent:a',
     text: 'slow-first',
@@ -169,7 +182,7 @@ test('pi replaces a timed-out session before the next queued message and rejects
       throw new Error('First turn timed out before reaching fixture');
     }),
   ]);
-  const second = engine.sendUserMessage({
+  const second = app.conversations.sendUserMessage({
     conversationId: conversation.id,
     to: 'agent:a',
     text: 'recovery-message',
@@ -182,7 +195,7 @@ test('pi replaces a timed-out session before the next queued message and rejects
   assert.doesNotMatch(JSON.stringify(fixture.requests[1]?.messages), /slow-first/);
   release.resolve();
   await new Promise((resolve) => setImmediate(resolve));
-  const third = await engine.sendUserMessage({
+  const third = await app.conversations.sendUserMessage({
     conversationId: conversation.id,
     to: 'agent:a',
     text: 'third-message',
@@ -191,7 +204,7 @@ test('pi replaces a timed-out session before the next queued message and rejects
   assert.match(JSON.stringify(fixture.requests[2]?.messages), /recovery-message/);
   assert.doesNotMatch(JSON.stringify(fixture.requests[2]?.messages), /slow-first/);
   assert.deepEqual(
-    engine.getConversation(conversation.id).messages.map((message) => message.status),
+    app.conversations.getConversation(conversation.id).messages.map((message) => message.status),
     ['failed', 'completed', 'delivered', 'completed', 'delivered'],
   );
 });

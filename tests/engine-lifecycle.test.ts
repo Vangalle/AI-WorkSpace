@@ -23,7 +23,8 @@ test('failed loading can be retried without retaining a lifecycle operation', as
   await assert.rejects(engine.startAgent('a'), { code: 'RUNTIME_ERROR' });
   assert.equal(engine.getAgent('a').status, 'start_failed');
   assert.deepEqual(engine.getAgent('a').error, {
-    code: 'RUNTIME_ERROR', message: 'Agent runtime failed',
+    code: 'RUNTIME_ERROR',
+    message: 'Agent runtime failed',
   });
   assert.equal((await engine.startAgent('a')).status, 'running');
   assert.equal(engine.getAgent('a').error, undefined);
@@ -66,11 +67,18 @@ test('stopping during loading waits for cleanup and cancels the startup request'
   assert.equal(engine.getAgent('a').status, 'stopping');
   await assert.rejects(engine.startAgent('a'), { code: 'AGENT_BUSY' });
   let finished = false;
-  void stopped.then(() => { finished = true; }, () => {});
-  loaded.resolve(runtime(async () => {
-    disposing.resolve();
-    await release.promise;
-  }));
+  void stopped.then(
+    () => {
+      finished = true;
+    },
+    () => {},
+  );
+  loaded.resolve(
+    runtime(async () => {
+      disposing.resolve();
+      await release.promise;
+    }),
+  );
   await disposing.promise;
   assert.equal(engine.getAgent('a').status, 'stopping');
   assert.equal(finished, false);
@@ -82,10 +90,12 @@ test('stopping during loading waits for cleanup and cancels the startup request'
 
 test('stopping a cancelled load succeeds even when the loader rejects', async (t) => {
   const release = deferred<void>();
-  const engine = new AgentEngine({ load: async () => {
-    await release.promise;
-    throw new Error('private loading detail');
-  } });
+  const engine = new AgentEngine({
+    load: async () => {
+      await release.promise;
+      throw new Error('private loading detail');
+    },
+  });
   t.after(() => engine.close());
   engine.registerAgent(config());
   const started = assert.rejects(engine.startAgent('a'), { code: 'AGENT_STOPPED' });
@@ -107,14 +117,21 @@ test('close shares its result and waits for a late load to finish cleanup', asyn
   const closed = engine.close();
   assert.equal(engine.close(), closed);
   let finished = false;
-  void closed.then(() => { finished = true; }, () => {});
+  void closed.then(
+    () => {
+      finished = true;
+    },
+    () => {},
+  );
   await tick();
   assert.equal(finished, false, 'close must wait for in-flight loading');
-  loaded.resolve(runtime(async () => {
-    disposals++;
-    disposing.resolve();
-    await release.promise;
-  }));
+  loaded.resolve(
+    runtime(async () => {
+      disposals++;
+      disposing.resolve();
+      await release.promise;
+    }),
+  );
   await disposing.promise;
   assert.equal(finished, false, 'close must also wait for disposal');
   assert.equal(engine.getAgent('a').status, 'stopping');
@@ -129,11 +146,14 @@ test('concurrent stops and close join the existing cleanup instead of disposing 
   const entered = deferred<void>();
   const release = deferred<void>();
   let disposals = 0;
-  const engine = new AgentEngine({ load: async () => runtime(async () => {
-    disposals++;
-    entered.resolve();
-    await release.promise;
-  }) });
+  const engine = new AgentEngine({
+    load: async () =>
+      runtime(async () => {
+        disposals++;
+        entered.resolve();
+        await release.promise;
+      }),
+  });
   engine.registerAgent(config());
   await engine.startAgent('a');
   const first = engine.stopAgent('a');
@@ -141,7 +161,12 @@ test('concurrent stops and close join the existing cleanup instead of disposing 
   const second = engine.stopAgent('a');
   const closed = engine.close();
   let finished = false;
-  void closed.then(() => { finished = true; }, () => {});
+  void closed.then(
+    () => {
+      finished = true;
+    },
+    () => {},
+  );
   await tick();
   assert.equal(finished, false);
   release.resolve();
@@ -153,10 +178,13 @@ test('concurrent stops and close join the existing cleanup instead of disposing 
 test('close reports safe cleanup failures after attempting every agent', async () => {
   let retry = false;
   const cleaned: string[] = [];
-  const engine = new AgentEngine({ load: async (agent) => runtime(() => {
-    if (agent.id === 'a' && !retry) throw new Error('secret cleanup detail');
-    cleaned.push(agent.id);
-  }) });
+  const engine = new AgentEngine({
+    load: async (agent) =>
+      runtime(() => {
+        if (agent.id === 'a' && !retry) throw new Error('secret cleanup detail');
+        cleaned.push(agent.id);
+      }),
+  });
   engine.registerAgent(config('a'));
   engine.registerAgent(config('b'));
   await engine.startAgent('a');
@@ -185,9 +213,11 @@ test('failed cleanup after a cancelled startup retains the late runtime for retr
   engine.registerAgent(config());
   const started = assert.rejects(engine.startAgent('a'), { code: 'RUNTIME_ERROR' });
   const closed = assert.rejects(engine.close(), AggregateError);
-  loaded.resolve(runtime(() => {
-    if (++disposals === 1) throw new Error('private cleanup detail');
-  }));
+  loaded.resolve(
+    runtime(() => {
+      if (++disposals === 1) throw new Error('private cleanup detail');
+    }),
+  );
   await Promise.all([started, closed]);
   assert.equal(engine.getAgent('a').status, 'stop_failed');
   await engine.stopAgent('a');
@@ -195,15 +225,18 @@ test('failed cleanup after a cancelled startup retains the late runtime for retr
   assert.equal(engine.getAgent('a').status, 'stopped');
 });
 
-test('close invoked from a room shutdown event shares the outer close result', async () => {
+test('close invoked from a lifecycle cancellation callback shares the outer close result', async () => {
   const engine = new AgentEngine({ load: async () => runtime() });
   engine.registerAgent(config());
   await engine.startAgent('a');
-  const room = engine.rooms.create(['user:alice', 'agent:a']);
   let reentered: Promise<void> | undefined;
-  engine.rooms.subscribe(room.id, 'user:alice', (event) => {
-    if (event.type === 'closed') reentered = engine.close();
-  });
+  engine.lifecycleSignal('a').addEventListener(
+    'abort',
+    () => {
+      reentered = engine.close();
+    },
+    { once: true },
+  );
   const closed = engine.close();
   assert.equal(reentered, closed);
   await closed;
@@ -212,7 +245,12 @@ test('close invoked from a room shutdown event shares the outer close result', a
 
 test('stopping an already stopped agent is idempotent', async (t) => {
   let disposals = 0;
-  const engine = new AgentEngine({ load: async () => runtime(() => { disposals++; }) });
+  const engine = new AgentEngine({
+    load: async () =>
+      runtime(() => {
+        disposals++;
+      }),
+  });
   t.after(() => engine.close());
   engine.registerAgent(config());
   assert.equal((await engine.stopAgent('a')).status, 'stopped');

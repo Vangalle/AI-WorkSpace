@@ -3,8 +3,8 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { test } from 'node:test';
-import { AgentEngine } from '../src/engine.js';
-import { createEngineServer } from '../src/http.js';
+import { ChatApplication } from '../src/application.js';
+import { createChatServer } from '../src/http.js';
 import { config } from './helpers.js';
 import type { Room } from '../src/rooms/types.js';
 
@@ -45,7 +45,7 @@ function client(base: string, roomId: string) {
 }
 
 test('terminal startup shows historical failed @ commands rather than skipping their activity', async (t) => {
-  const engine = new AgentEngine(
+  const app = new ChatApplication(
     {
       load: async () => ({
         receive: async () => 'direct',
@@ -55,20 +55,20 @@ test('terminal startup shows historical failed @ commands rather than skipping t
     },
     { roomDebounceMs: 0 },
   );
-  engine.registerAgent(config('a'));
-  await engine.startAgent('a');
-  const room = engine.rooms.create(['user:alice', 'agent:a']);
-  engine.rooms.post(room.id, 'user:alice', { text: '@a old command' });
-  while (!engine.rooms.get(room.id, 'user:alice').activity.length)
+  app.agents.registerAgent(config('a'));
+  await app.agents.startAgent('a');
+  const room = app.rooms.create(['user:alice', 'agent:a']);
+  app.rooms.post(room.id, 'user:alice', { text: '@a old command' });
+  while (!app.rooms.get(room.id, 'user:alice').activity.length)
     await new Promise((resolve) => setTimeout(resolve, 5));
-  const server = createEngineServer(engine, {
+  const server = createChatServer(app, {
     token: 'recovery-admin-token-123456789',
     userTokens: { 'user:alice': token },
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   t.after(async () => {
-    await engine.close();
+    await app.close();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
@@ -100,6 +100,7 @@ test('terminal expired-cursor recovery shows missed failures and deduplicates sn
   };
   const room: Room = {
     id: 'recovery-room',
+    status: 'open',
     eventCursor: 10,
     participants: ['user:alice', 'agent:a'],
     messages: [],

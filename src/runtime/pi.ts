@@ -8,14 +8,8 @@ import {
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import type {
-  ActorId,
-  AgentConfig,
-  AgentRuntime,
-  AgentRuntimeFactory,
-  Message,
-  RuntimeContext,
-} from '../agent.js';
+import type { ActorId, AgentConfig, AgentRuntime, AgentRuntimeFactory } from '../agent.js';
+import type { Message, RuntimeContext } from '../conversation-types.js';
 import { checkSignal, EngineError } from '../errors.js';
 import { actor, agentConfig } from '../validation.js';
 import { piResources } from './pi-resources.js';

@@ -1,19 +1,6 @@
-import { randomUUID } from 'node:crypto';
-import type {
-  ActorId,
-  AgentConfig,
-  AgentRuntime,
-  AgentRuntimeFactory,
-  AgentView,
-  Conversation,
-  Message,
-  SendInput,
-  SendResult,
-} from './agent.js';
+import type { AgentConfig, AgentRuntime, AgentRuntimeFactory, AgentView } from './agent.js';
 import { abortable, checkSignal, EngineError, failure, safeError } from './errors.js';
-import { actor, agentConfig, identifier, invalid, sendInput, text } from './validation.js';
-import { ChatRooms } from './rooms/chat-rooms.js';
-import { MAX_CONVERSATION_PARTICIPANTS } from './constants.js';
+import { agentConfig, identifier } from './validation.js';
 
 interface Startup {
   loaded: Promise<void>;
@@ -22,83 +9,20 @@ interface Startup {
 
 interface Instance extends AgentView {
   runtime?: AgentRuntime;
+  lifetime?: AbortController;
   startup?: Startup;
   stopping?: Promise<AgentView>;
 }
 
-/**
- * One directed root request and its nested sends: shared abort, busy set, and send budget.
- * Nested sends inherit this state; they cannot start a fresh turn or reset the limits.
- */
-interface Turn {
-  controller: AbortController;
-  agents: Set<ActorId>;
-  busy: Set<ActorId>;
-  sendsLeft: number;
-}
-
-/**
- * In-memory IM-neutral messaging: directed request/reply and shared rooms.
- * Owns identities, authorization, routing, idempotency, deadlines, and lifecycle.
- * Runtimes own inference and directed history; room transcript/events live in `rooms`.
- * Both modes share agent lifecycle, but not sessions or reply semantics.
- */
+/** Owns agent identities, runtime resources and lifecycle, not communication state. */
 export class AgentEngine {
   private readonly agents = new Map<string, Instance>();
-  private readonly conversations = new Map<string, Conversation>();
-  /** Per-conversation root queue only; nesting through the same queue would deadlock the turn. */
-  private readonly queues = new Map<string, Promise<unknown>>();
-  /** Idempotent replay cache keyed by sender + conversation + clientId. */
-  private readonly replays = new Map<
-    string,
-    { fingerprint: string; result: Promise<SendResult> }
-  >();
-  private readonly turns = new Set<Turn>();
   private closed = false;
   private closing?: Promise<void>;
-  private readonly timeoutMs: number;
 
-  readonly rooms: ChatRooms;
+  constructor(private readonly factory: AgentRuntimeFactory) {}
 
-  constructor(
-    private readonly factory: AgentRuntimeFactory,
-    options: { timeoutMs?: number; roomDebounceMs?: number; roomMaxWaitMs?: number } = {},
-  ) {
-    this.timeoutMs = options.timeoutMs ?? 30_000;
-    if (!Number.isFinite(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 300_000)
-      invalid('timeoutMs must be between 1 and 300000');
-    this.rooms = new ChatRooms(
-      {
-        assertAgent: (id) => {
-          this.assertOpen();
-          this.instance(id);
-        },
-        observe: async (id, input, signal) => {
-          this.assertOpen();
-          const instance = this.instance(id);
-          if (instance.status !== 'running' || !instance.runtime)
-            throw new EngineError('AGENT_UNAVAILABLE', 'Agent is not running', 409);
-          // Room chat must not fall back to directed `receive` (that would force a reply).
-          if (!instance.runtime.observe)
-            throw new EngineError(
-              'UNSUPPORTED_RUNTIME',
-              'Runtime does not support room participation',
-              409,
-            );
-          return instance.runtime.observe(input, { signal });
-        },
-      },
-      {
-        timeoutMs: this.timeoutMs,
-        ...(options.roomDebounceMs === undefined ? {} : { debounceMs: options.roomDebounceMs }),
-        ...(options.roomMaxWaitMs === undefined ? {} : { maxWaitMs: options.roomMaxWaitMs }),
-      },
-    );
-  }
-
-  /** Register a stopped agent. IDs must be unique.
-   *  ID is returned.
-  */
+  /** Register a stopped agent. IDs must be unique. */
   registerAgent(value: AgentConfig): AgentView {
     this.assertOpen();
     const config = agentConfig(value);
@@ -153,6 +77,7 @@ export class AgentEngine {
         await startup.cancellation.stopped;
         throw startup.cancellation.reason;
       }
+      instance.lifetime = new AbortController();
       instance.status = 'running';
       return this.getAgent(id);
     } finally {
@@ -160,34 +85,79 @@ export class AgentEngine {
     }
   }
 
-  /** Cancel loading/active work and dispose the runtime. Concurrent stops share cleanup. */
+  /** The signal belongs to this runtime generation and remains aborted after restart. */
+  lifecycleSignal(id: string): AbortSignal {
+    this.assertOpen();
+    const instance = this.instance(id);
+    if (instance.status !== 'running' || !instance.lifetime)
+      throw new EngineError('AGENT_UNAVAILABLE', 'Agent is not running', 409);
+    return instance.lifetime.signal;
+  }
+
+  /** Capture one running runtime; stop/restart cancels the lease, never redirects it. */
+  async useRuntime<T>(
+    id: string,
+    operation: (runtime: AgentRuntime, signal: AbortSignal) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const lifetime = this.lifecycleSignal(id);
+    const runtime = this.instance(id).runtime!;
+    const combined = signal ? AbortSignal.any([lifetime, signal]) : lifetime;
+    checkSignal(combined);
+    const result = await abortable(
+      Promise.resolve().then(() => {
+        checkSignal(combined);
+        return operation(runtime, combined);
+      }),
+      combined,
+    );
+    checkSignal(combined);
+    return result;
+  }
+
+  /** Cancel runtime leases and dispose resources; concurrent stops share cleanup. */
   async stopAgent(id: string): Promise<AgentView> {
     const instance = this.instance(id);
     if (instance.stopping) return instance.stopping;
     if (instance.status === 'stopped') return this.getAgent(id);
     instance.status = 'stopping';
+
+    let reason: EngineError;
+    if (this.closed) reason = new EngineError('CLOSED', 'Engine is closed', 503);
+    else reason = new EngineError('AGENT_STOPPED', 'Agent was stopped', 409);
+
     const startup = instance.startup;
     const operation = this.disposeAgent(id, instance, startup?.loaded);
     instance.stopping = operation;
-    if (startup && !startup.cancellation) {
-      startup.cancellation = {
-        reason: this.closed
-          ? new EngineError('CLOSED', 'Engine is closed', 503)
-          : new EngineError('AGENT_STOPPED', 'Agent was stopped', 409),
-        stopped: operation,
-      };
-    }
-    const actorId = `agent:${id}` as const;
-    this.rooms.cancelAgent(actorId);
-    for (const turn of this.turns) {
-      if (turn.agents.has(actorId))
-        turn.controller.abort(new EngineError('AGENT_STOPPED', 'Agent was stopped', 409));
-    }
+    if (startup && !startup.cancellation) startup.cancellation = { reason, stopped: operation };
+    instance.lifetime?.abort(reason);
     try {
       return await operation;
     } finally {
       if (instance.stopping === operation) delete instance.stopping;
     }
+  }
+
+  /** Wait for agent cleanup only. Repeated calls share failures as well as success. */
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    // Abort callbacks may synchronously reenter close().
+    this.closing = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    this.closed = true;
+    void Promise.allSettled([...this.agents.keys()].map((id) => this.stopAgent(id)))
+      .then((results) => {
+        const errors = results.flatMap((result) =>
+          result.status === 'rejected' ? [safeError(result.reason)] : [],
+        );
+        if (errors.length) throw new AggregateError(errors, 'Failed to stop one or more agents');
+      })
+      .then(resolveClose, rejectClose);
+    return this.closing;
   }
 
   private async disposeAgent(
@@ -200,6 +170,7 @@ export class AgentEngine {
     try {
       await instance.runtime?.dispose();
       delete instance.runtime;
+      delete instance.lifetime;
       delete instance.error;
       instance.status = 'stopped';
       return this.getAgent(id);
@@ -210,243 +181,10 @@ export class AgentEngine {
     }
   }
 
-  /** Create a conversation with immutable participants (agents must already be registered). */
-  createConversation(participants: ActorId[]): Conversation {
-    this.assertOpen();
-    if (!Array.isArray(participants) || participants.length < 2 || participants.length > MAX_CONVERSATION_PARTICIPANTS)
-      invalid(`A conversation needs 2 to ${MAX_CONVERSATION_PARTICIPANTS} participants`);
-    const members = [...new Set(participants.map(actor))];
-    if (members.length < 2) invalid('A conversation needs two distinct participants');
-    for (const member of members) if (member.startsWith('agent:')) this.instance(member.slice(6));
-    const conversation: Conversation = { id: randomUUID(), participants: members, messages: [] };
-    this.conversations.set(conversation.id, conversation);
-    return structuredClone(conversation);
-  }
-
-  getConversation(id: string): Conversation {
-    return structuredClone(this.conversation(id));
-  }
-
-  /** Send as the fixed local owner principal `user:local-user`. */
-  sendUserMessage(input: SendInput): Promise<SendResult> {
-    return this.enqueue('user:local-user', input);
-  }
-
-  /** Trusted in-process send as a registered agent (not exposed over HTTP). */
-  sendAgentMessage(id: string, input: SendInput): Promise<SendResult> {
-    return this.enqueue(`agent:${identifier(id)}`, input);
-  }
-
-  /** Wait for all agent cleanup; repeated calls share the result, including an AggregateError on failure. */
-  close(): Promise<void> {
-    if (this.closing) return this.closing;
-    let resolveClose!: () => void;
-    let rejectClose!: (error: unknown) => void;
-    // Shutdown events can synchronously reenter close(), so publish its result first.
-    this.closing = new Promise<void>((resolve, reject) => {
-      resolveClose = resolve;
-      rejectClose = reject;
-    });
-    this.closed = true;
-    this.rooms.close();
-    for (const turn of this.turns)
-      turn.controller.abort(new EngineError('CLOSED', 'Engine is closed', 503));
-    void Promise.allSettled([...this.agents.keys()].map((id) => this.stopAgent(id)))
-      .then((results) => {
-        const errors = results.flatMap((result) =>
-          result.status === 'rejected' ? [safeError(result.reason)] : [],
-        );
-        if (errors.length) throw new AggregateError(errors, 'Failed to stop one or more agents');
-      })
-      .then(resolveClose, rejectClose);
-    return this.closing;
-  }
-
-  private async enqueue(from: ActorId, value: SendInput): Promise<SendResult> {
-    this.assertOpen();
-    const input = sendInput(value);
-    this.authorize(from, input);
-    const replayKey = input.clientId
-      ? JSON.stringify([from, input.conversationId, input.clientId])
-      : undefined;
-    const fingerprint = JSON.stringify([input.to, input.text]);
-    if (replayKey) {
-      const replay = this.replays.get(replayKey);
-      if (replay) {
-        if (replay.fingerprint !== fingerprint)
-          throw new EngineError(
-            'IDEMPOTENCY_CONFLICT',
-            'clientId was used for different content',
-            409,
-          );
-        return structuredClone(await replay.result);
-      }
-    }
-    // Chain onto the prior root for this conversation; nested sends run inside the same turn.
-    const previous = this.queues.get(input.conversationId) ?? Promise.resolve();
-    const result = previous
-      .catch(() => {})
-      .then(async () => {
-        this.assertOpen();
-        const turn: Turn = {
-          controller: new AbortController(),
-          agents: new Set(),
-          busy: new Set(),
-          sendsLeft: 16,
-        };
-        if (from.startsWith('agent:')) turn.agents.add(from);
-        this.turns.add(turn);
-        // Deadline starts when the root begins, not when it was enqueued; nested
-        // sends share this timer instead of getting a fresh timeout.
-        const timer = setTimeout(
-          () =>
-            turn.controller.abort(new EngineError('TIMEOUT', 'Agent processing timed out', 504)),
-          this.timeoutMs,
-        );
-        try {
-          return await this.dispatch(from, input, turn, from.startsWith('agent:') ? [from] : []);
-        } finally {
-          clearTimeout(timer);
-          // Invalidate late nested sends after the root turn completes.
-          turn.controller.abort(new EngineError('TURN_FINISHED', 'Message turn has finished', 409));
-          this.turns.delete(turn);
-        }
-      });
-    this.queues.set(input.conversationId, result);
-    if (replayKey) this.replays.set(replayKey, { fingerprint, result });
-    try {
-      return structuredClone(await result);
-    } finally {
-      if (this.queues.get(input.conversationId) === result)
-        this.queues.delete(input.conversationId);
-    }
-  }
-
-  private async dispatch(
-    from: ActorId,
-    input: SendInput,
-    turn: Turn,
-    chain: ActorId[],
-  ): Promise<SendResult> {
-    checkSignal(turn.controller.signal);
-    // Authorization or sender status may have changed while queued; recheck at dispatch time.
-    const conversation = this.authorize(from, input);
-    if (input.to.startsWith('agent:')) {
-      if (chain.includes(input.to))
-        throw new EngineError('AGENT_CYCLE', 'Cyclic agent request rejected', 409);
-      if (chain.length >= 4)
-        throw new EngineError('AGENT_DEPTH', 'Agent request depth exceeded', 409);
-      if (turn.busy.has(input.to))
-        throw new EngineError('AGENT_BUSY', 'Agent already processing in this conversation', 409);
-    }
-    const message = this.record(conversation, from, input.to, input.text);
-    if (input.to.startsWith('user:')) {
-      message.status = 'delivered';
-      return { message };
-    }
-    let busy = false;
-    let acceptingSends = true;
-    try {
-      const instance = this.instance(input.to.slice(6));
-      if (instance.status !== 'running' || !instance.runtime)
-        throw new EngineError('AGENT_UNAVAILABLE', 'Recipient agent is not running', 409);
-      turn.agents.add(input.to);
-      turn.busy.add(input.to);
-      busy = true;
-      message.status = 'processing';
-      const context = {
-        signal: turn.controller.signal,
-        participants: Object.freeze([...conversation.participants]),
-        send: async (to: ActorId, content: string): Promise<SendResult> => {
-          checkSignal(turn.controller.signal);
-          if (!acceptingSends)
-            throw new EngineError('TURN_FINISHED', 'Agent message handling has finished', 409);
-          if (turn.sendsLeft-- <= 0)
-            throw new EngineError('SEND_LIMIT', 'Per-turn send limit exceeded', 429);
-          const result = await this.dispatch(
-            input.to,
-            sendInput({ conversationId: input.conversationId, to, text: content }),
-            turn,
-            [...chain, input.to],
-          );
-          if (result.message.error)
-            throw new EngineError(result.message.error.code, result.message.error.message, 502);
-          return structuredClone(result);
-        },
-      };
-      const response = await abortable(
-        Promise.resolve().then(() => instance.runtime!.receive(structuredClone(message), context)),
-        turn.controller.signal,
-      );
-      checkSignal(turn.controller.signal);
-      text(response, 'Agent response');
-      const reply = this.record(conversation, input.to, from, response, message.id);
-      reply.status = 'delivered';
-      message.status = 'completed';
-      return { message, reply };
-    } catch (error) {
-      // Preserve the message ID and safe failure; callers must inspect status,
-      // not just promise fulfillment.
-      message.status = 'failed';
-      message.error = failure(error);
-      return { message };
-    } finally {
-      acceptingSends = false;
-      if (busy) turn.busy.delete(input.to);
-    }
-  }
-
-  private authorize(from: ActorId, input: SendInput): Conversation {
-    const conversation = this.conversation(input.conversationId);
-    if (!conversation.participants.includes(from) || !conversation.participants.includes(input.to))
-      throw new EngineError(
-        'FORBIDDEN',
-        'Sender and recipient must belong to this conversation',
-        403,
-      );
-    if (from === input.to)
-      throw new EngineError('AGENT_CYCLE', 'Cannot send a message to yourself', 409);
-    if (from.startsWith('agent:')) {
-      const instance = this.instance(from.slice(6));
-      if (instance.status !== 'running')
-        throw new EngineError('AGENT_UNAVAILABLE', 'Sender agent is not running', 409);
-      if (!instance.config.allowSendTo.includes(input.to))
-        throw new EngineError('FORBIDDEN', 'Agent may not send to this recipient', 403);
-    }
-    return conversation;
-  }
-
-  private record(
-    conversation: Conversation,
-    from: ActorId,
-    to: ActorId,
-    content: string,
-    replyTo?: string,
-  ): Message {
-    const message: Message = {
-      id: randomUUID(),
-      conversationId: conversation.id,
-      from,
-      to,
-      text: content,
-      createdAt: new Date().toISOString(),
-      status: 'accepted',
-    };
-    if (replyTo) message.replyTo = replyTo;
-    conversation.messages.push(message);
-    return message;
-  }
-
   private instance(id: string): Instance {
     const instance = this.agents.get(identifier(id));
     if (!instance) throw new EngineError('NOT_FOUND', 'Agent not found', 404);
     return instance;
-  }
-
-  private conversation(id: string): Conversation {
-    const conversation = this.conversations.get(identifier(id, 'conversationId'));
-    if (!conversation) throw new EngineError('NOT_FOUND', 'Conversation not found', 404);
-    return conversation;
   }
 
   private assertOpen(): void {
