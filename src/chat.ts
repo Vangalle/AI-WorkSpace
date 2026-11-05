@@ -21,17 +21,28 @@ async function chat() {
     const configs = [];
     for (const path of paths.length ? paths : ['examples/agent.json']) {
       let input: unknown;
-      try { input = JSON.parse(await readFile(path, 'utf8')); }
-      catch { throw new EngineError('CONFIG_ERROR', 'Could not read an agent configuration file'); }
+      try {
+        input = JSON.parse(await readFile(path, 'utf8'));
+      } catch {
+        throw new EngineError('CONFIG_ERROR', 'Could not read an agent configuration file');
+      }
       const config = agentConfig(input);
       configs.push(config);
       engine.registerAgent(config);
       await engine.startAgent(config.id);
     }
     const first = configs[0]!;
-    const conversation = engine.createConversation(['user:local-user', ...configs.map((config) => `agent:${config.id}` as const)]);
-    const result = await engine.sendUserMessage({ conversationId: conversation.id, to: `agent:${first.id}`, text: message });
-    if (result.message.error) throw new EngineError(result.message.error.code, result.message.error.message);
+    const conversation = engine.createConversation([
+      'user:local-user',
+      ...configs.map((config) => `agent:${config.id}` as const),
+    ]);
+    const result = await engine.sendUserMessage({
+      conversationId: conversation.id,
+      to: `agent:${first.id}`,
+      text: message,
+    });
+    if (result.message.error)
+      throw new EngineError(result.message.error.code, result.message.error.message);
     console.log(result.reply?.text ?? '');
   } finally {
     await engine.close();

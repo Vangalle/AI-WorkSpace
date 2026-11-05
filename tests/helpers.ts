@@ -1,4 +1,10 @@
-import type { AgentConfig, AgentRuntime, AgentRuntimeFactory, Message, RuntimeContext } from '../src/agent.js';
+import type {
+  AgentConfig,
+  AgentRuntime,
+  AgentRuntimeFactory,
+  Message,
+  RuntimeContext,
+} from '../src/agent.js';
 
 export function config(id = 'a', overrides: Partial<AgentConfig> = {}): AgentConfig {
   return {
@@ -11,15 +17,22 @@ export function config(id = 'a', overrides: Partial<AgentConfig> = {}): AgentCon
   };
 }
 
-export type Handler = (message: Readonly<Message>, context: RuntimeContext, history: string[], agent: AgentConfig) => Promise<string>;
+export type Handler = (
+  message: Readonly<Message>,
+  context: RuntimeContext,
+  history: string[],
+  agent: AgentConfig,
+) => Promise<string>;
 
 export class TestRuntimeFactory implements AgentRuntimeFactory {
   loads: AgentConfig[] = [];
   disposals: string[] = [];
-  constructor(public handler: Handler = async (message, _context, history) => {
-    history.push(message.text);
-    return `${history.length}: ${message.text}`;
-  }) {}
+  constructor(
+    public handler: Handler = async (message, _context, history) => {
+      history.push(message.text);
+      return `${history.length}: ${message.text}`;
+    },
+  ) {}
 
   async load(agent: AgentConfig): Promise<AgentRuntime> {
     this.loads.push(structuredClone(agent));
@@ -30,13 +43,18 @@ export class TestRuntimeFactory implements AgentRuntimeFactory {
         histories.set(message.conversationId, history);
         return this.handler(message, context, history, agent);
       },
-      dispose: async () => { this.disposals.push(agent.id); histories.clear(); },
+      dispose: async () => {
+        this.disposals.push(agent.id);
+        histories.clear();
+      },
     };
   }
 }
 
 export function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
   return { promise, resolve };
 }

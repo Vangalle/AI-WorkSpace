@@ -1,7 +1,21 @@
 import { resolve } from 'node:path';
-import { createAgentSession, ModelRuntime, SessionManager, SettingsManager, type AgentSession, type ToolDefinition } from '@earendil-works/pi-coding-agent';
+import {
+  createAgentSession,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+  type AgentSession,
+  type ToolDefinition,
+} from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
-import type { ActorId, AgentConfig, AgentRuntime, AgentRuntimeFactory, Message, RuntimeContext } from '../agent.js';
+import type {
+  ActorId,
+  AgentConfig,
+  AgentRuntime,
+  AgentRuntimeFactory,
+  Message,
+  RuntimeContext,
+} from '../agent.js';
 import { checkSignal, EngineError } from '../errors.js';
 import { actor, agentConfig } from '../validation.js';
 import { piResources } from './pi-resources.js';
@@ -16,8 +30,10 @@ export interface PiRuntimeOptions {
 }
 
 /**
- * Pi SDK adapter: one in-memory session per conversation, custom `send_message` tool,
- * no shell/file tools, and failed inference discards the session instead of reusing ambiguous history.
+ * Pi adapter: one in-memory directed session per conversation; room observations
+ * use isolated temporary sessions that never share that history or `send_message`.
+ * Only communication tools are enabled. Failed directed sessions are discarded
+ * so partial history is not reused.
  */
 export class PiRuntimeFactory implements AgentRuntimeFactory {
   private readonly cwd: string;
@@ -37,13 +53,26 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
       refreshOnCreate: false,
     });
     const model = modelRuntime.getModel(config.model.provider, config.model.id);
-    if (!model) throw new EngineError('MODEL_NOT_FOUND', 'Configured provider/model was not found', 400);
+    if (!model)
+      throw new EngineError('MODEL_NOT_FOUND', 'Configured provider/model was not found', 400);
     if (config.model.apiKeyEnv) {
       const key = process.env[config.model.apiKeyEnv];
-      if (!key?.trim()) throw new EngineError('MISSING_CREDENTIALS', 'Configured credential environment variable is empty', 400);
+      if (!key?.trim())
+        throw new EngineError(
+          'MISSING_CREDENTIALS',
+          'Configured credential environment variable is empty',
+          400,
+        );
       await modelRuntime.setRuntimeApiKey(config.model.provider, key);
     }
-    const roomObserver = createPiRoomObserver(config, { cwd: this.cwd, agentDir: this.agentDir, model, modelRuntime });
+    // Share model configuration and credentials, but keep room observers out of
+    // the directed session cache.
+    const roomObserver = createPiRoomObserver(config, {
+      cwd: this.cwd,
+      agentDir: this.agentDir,
+      model,
+      modelRuntime,
+    });
     const sessions = new Map<string, { session: AgentSession; active?: RuntimeContext }>();
     let disposed = false;
 
@@ -51,10 +80,15 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
       const existing = sessions.get(conversationId);
       if (existing) return existing;
       const entry: { session?: AgentSession; active?: RuntimeContext } = {};
-      const parameters = Type.Object({ to: Type.String(), text: Type.String({ minLength: 1, maxLength: 32000 }) });
+      const parameters = Type.Object({
+        to: Type.String(),
+        text: Type.String({ minLength: 1, maxLength: 32000 }),
+      });
       const sendTool: ToolDefinition<typeof parameters> = {
-        name: 'send_message', label: 'Send message',
-        description: 'Send to an allowed participant in this conversation. For an agent recipient, return its reply. Do not call yourself or an agent already in the call chain.',
+        name: 'send_message',
+        label: 'Send message',
+        description:
+          'Send to an allowed participant in this conversation. For an agent recipient, return its reply. Do not call yourself or an agent already in the call chain.',
         parameters,
         async execute(_id, params) {
           const context = entry.active;
@@ -65,11 +99,19 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
         },
       };
       const { session } = await createAgentSession({
-        cwd: this.cwd, agentDir: this.agentDir, model, modelRuntime, thinkingLevel: 'off',
-        tools: ['send_message'], customTools: [sendTool],
+        cwd: this.cwd,
+        agentDir: this.agentDir,
+        model,
+        modelRuntime,
+        thinkingLevel: 'off',
+        tools: ['send_message'],
+        customTools: [sendTool],
         resourceLoader: piResources(config),
         sessionManager: SessionManager.inMemory(this.cwd),
-        settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
+        settingsManager: SettingsManager.inMemory({
+          compaction: { enabled: false },
+          retry: { enabled: false },
+        }),
       });
       if (disposed) {
         session.dispose();
@@ -88,32 +130,55 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
         checkSignal(context.signal);
         const entry = await openSession(message.conversationId);
         checkSignal(context.signal);
-        if (entry.active) throw new EngineError('AGENT_BUSY', 'Session is processing another message', 409);
+        if (entry.active)
+          throw new EngineError('AGENT_BUSY', 'Session is processing another message', 409);
         entry.active = context;
         const cancel = () => {
-          // Drop the session on abort so a late model completion cannot reuse stale context.
-          if (sessions.get(message.conversationId) === entry) sessions.delete(message.conversationId);
+          // Drop this session on abort so a late completion cannot reuse it, and
+          // so the next queued message can open a fresh session immediately.
+          if (sessions.get(message.conversationId) === entry)
+            sessions.delete(message.conversationId);
           delete entry.active;
           void entry.session.abort().catch(() => {});
         };
         context.signal.addEventListener('abort', cancel, { once: true });
         try {
-          await entry.session.prompt(JSON.stringify({
-            sender: message.from, recipient: message.to, text: message.text,
-            participants: context.participants,
-            allowedRecipients: config.allowSendTo.filter((recipient: ActorId) => context.participants.includes(recipient)),
-          }), { expandPromptTemplates: false });
+          await entry.session.prompt(
+            JSON.stringify({
+              sender: message.from,
+              recipient: message.to,
+              text: message.text,
+              participants: context.participants,
+              allowedRecipients: config.allowSendTo.filter((recipient: ActorId) =>
+                context.participants.includes(recipient),
+              ),
+            }),
+            { expandPromptTemplates: false },
+          );
           checkSignal(context.signal);
           const last = entry.session.messages.at(-1);
-          if (!last || last.role !== 'assistant' || !('stopReason' in last) || last.stopReason === 'error' || last.stopReason === 'aborted') {
+          if (
+            !last ||
+            last.role !== 'assistant' ||
+            !('stopReason' in last) ||
+            last.stopReason === 'error' ||
+            last.stopReason === 'aborted'
+          ) {
             throw new EngineError('MODEL_ERROR', 'Model did not complete successfully', 502);
           }
-          const response = last.content.filter((part) => part.type === 'text').map((part) => part.text).join('\n');
-          if (!response.trim()) throw new EngineError('MODEL_ERROR', 'Model returned no text response', 502);
+          const response = last.content
+            .filter((part) => part.type === 'text')
+            .map((part) => part.text)
+            .join('\n');
+          if (!response.trim())
+            throw new EngineError('MODEL_ERROR', 'Model returned no text response', 502);
           return response;
         } catch (error) {
           entry.session.dispose();
-          if (sessions.get(message.conversationId) === entry) sessions.delete(message.conversationId);
+          // Late cleanup may run after a replacement exists;
+          // remove only this entry, never its successor.
+          if (sessions.get(message.conversationId) === entry)
+            sessions.delete(message.conversationId);
           throw error;
         } finally {
           context.signal.removeEventListener('abort', cancel);

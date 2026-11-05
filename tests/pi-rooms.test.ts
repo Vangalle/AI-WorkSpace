@@ -7,11 +7,28 @@ import { fixtureProvider, providerText } from './fixtures/provider.js';
 
 async function setup() {
   const fixture = await fixtureProvider();
-  const engine = new AgentEngine(new PiRuntimeFactory({ cwd: fixture.directory, agentDir: fixture.directory, modelsPath: fixture.modelsPath }), { roomDebounceMs: 0, timeoutMs: 5000 });
-  engine.registerAgent(config('a', { model: { provider: 'fixture', id: 'fixture-model' }, allowSendTo: [] }));
+  const engine = new AgentEngine(
+    new PiRuntimeFactory({
+      cwd: fixture.directory,
+      agentDir: fixture.directory,
+      modelsPath: fixture.modelsPath,
+    }),
+    { roomDebounceMs: 0, timeoutMs: 5000 },
+  );
+  engine.registerAgent(
+    config('a', { model: { provider: 'fixture', id: 'fixture-model' }, allowSendTo: [] }),
+  );
   await engine.startAgent('a');
   const room = engine.rooms.create(['user:alice', 'user:bob', 'agent:a']);
-  return { engine, fixture, room, close: async () => { await engine.close(); await fixture.close(); } };
+  return {
+    engine,
+    fixture,
+    room,
+    close: async () => {
+      await engine.close();
+      await fixture.close();
+    },
+  };
 }
 
 async function settled(engine: AgentEngine, roomId: string, count = 1) {
@@ -30,7 +47,10 @@ test('real Pi SDK room observer publishes explicit actions, not final assistant 
   const view = await settled(engine, room.id);
   assert.equal(view.activity[0]?.status, 'replied');
   assert.equal(view.messages[1]?.text, 'room fixture reply');
-  assert.deepEqual(fixture.requests[0]?.tools?.map((tool) => tool.function.name), ['room_action']);
+  assert.deepEqual(
+    fixture.requests[0]?.tools?.map((tool) => tool.function.name),
+    ['room_action'],
+  );
   assert.doesNotMatch(JSON.stringify(view.messages), /A concludes/);
 });
 
@@ -55,7 +75,10 @@ test('@ command metadata reaches the real SDK and a silent command becomes visib
   const view = await settled(engine, room.id);
   assert.equal(view.activity[0]?.error?.code, 'COMMAND_UNANSWERED');
   const input = fixture.requests[0]!.messages.find((m) => m.role === 'user');
-  const payload = JSON.parse(providerText(input!.content)) as { requested: boolean; commandMessageIds: string[] };
+  const payload = JSON.parse(providerText(input!.content)) as {
+    requested: boolean;
+    commandMessageIds: string[];
+  };
   assert.equal(payload.requested, true);
   assert.deepEqual(payload.commandMessageIds, [view.messages[0]!.id]);
 });
@@ -78,15 +101,26 @@ test('room and directed SDK sessions cannot leak histories across boundaries', a
   const { engine, fixture, room, close } = await setup();
   t.after(close);
   const direct = engine.createConversation(['user:local-user', 'agent:a']);
-  await engine.sendUserMessage({ conversationId: direct.id, to: 'agent:a', text: 'private-secret' });
+  await engine.sendUserMessage({
+    conversationId: direct.id,
+    to: 'agent:a',
+    text: 'private-secret',
+  });
   engine.rooms.post(room.id, 'user:alice', { text: '@a group-question' });
   await settled(engine, room.id);
   assert.doesNotMatch(JSON.stringify(fixture.requests[1]?.messages), /private-secret/);
-  await engine.sendUserMessage({ conversationId: direct.id, to: 'agent:a', text: 'private-followup' });
+  await engine.sendUserMessage({
+    conversationId: direct.id,
+    to: 'agent:a',
+    text: 'private-followup',
+  });
   assert.match(JSON.stringify(fixture.requests.at(-1)?.messages), /private-secret/);
   assert.doesNotMatch(JSON.stringify(fixture.requests.at(-1)?.messages), /group-question/);
   const other = engine.rooms.create(['user:alice', 'agent:a']);
   engine.rooms.post(other.id, 'user:alice', { text: '@a other-room' });
   await settled(engine, other.id);
-  assert.doesNotMatch(JSON.stringify(fixture.requests.at(-2)?.messages), /group-question|private-secret/);
+  assert.doesNotMatch(
+    JSON.stringify(fixture.requests.at(-2)?.messages),
+    /group-question|private-secret/,
+  );
 });

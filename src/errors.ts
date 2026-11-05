@@ -2,7 +2,11 @@ import type { Failure } from './agent.js';
 
 /** Typed engine failure with HTTP-oriented status for the local API. */
 export class EngineError extends Error {
-  constructor(public readonly code: string, message: string, public readonly status = 400) {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly status = 400,
+  ) {
     super(message);
     this.name = 'EngineError';
   }
@@ -10,7 +14,9 @@ export class EngineError extends Error {
 
 /** Map unknown throws to a safe EngineError without leaking internals. */
 export function safeError(error: unknown): EngineError {
-  return error instanceof EngineError ? error : new EngineError('RUNTIME_ERROR', 'Agent runtime failed', 502);
+  return error instanceof EngineError
+    ? error
+    : new EngineError('RUNTIME_ERROR', 'Agent runtime failed', 502);
 }
 
 /** Convert an error into a transcript-safe Failure record. */
@@ -24,7 +30,10 @@ export function checkSignal(signal: AbortSignal): void {
   if (signal.aborted) throw safeError(signal.reason);
 }
 
-/** Race a promise against abort; cleans up the abort listener afterward. */
+/**
+ * Stop waiting on abort without forcibly terminating the underlying promise.
+ * Callers must pass the signal to the runtime and recheck it before publishing late results.
+ */
 export async function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   checkSignal(signal);
   let onAbort!: () => void;

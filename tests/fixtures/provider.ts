@@ -12,11 +12,14 @@ export interface ProviderRequest {
 
 export function providerText(content: unknown): string {
   if (typeof content === 'string') return content;
-  if (Array.isArray(content)) return content.map((part) => typeof part?.text === 'string' ? part.text : '').join('');
+  if (Array.isArray(content))
+    return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('');
   return JSON.stringify(content);
 }
 
-export async function fixtureProvider(options: { beforeReply?: (request: ProviderRequest) => Promise<void> } = {}) {
+export async function fixtureProvider(
+  options: { beforeReply?: (request: ProviderRequest) => Promise<void> } = {},
+) {
   const directory = await mkdtemp(join(tmpdir(), 'agent-im-'));
   const requests: ProviderRequest[] = [];
   const server = createServer(async (request, response) => {
@@ -30,29 +33,76 @@ export async function fixtureProvider(options: { beforeReply?: (request: Provide
     const content = providerText(last?.content);
     if (content.includes('provider-failure')) {
       response.writeHead(401, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ error: { message: 'secret-provider-error', type: 'authentication_error' } }));
+      response.end(
+        JSON.stringify({
+          error: { message: 'secret-provider-error', type: 'authentication_error' },
+        }),
+      );
       return;
     }
-    const system = JSON.stringify(input.messages.find((message) => ['system', 'developer'].includes(message.role))?.content);
-    const toolCall = system.includes('You are a.') && last?.role === 'user' && content.includes('delegate');
+    const system = JSON.stringify(
+      input.messages.find((message) => ['system', 'developer'].includes(message.role))?.content,
+    );
+    const toolCall =
+      system.includes('You are a.') && last?.role === 'user' && content.includes('delegate');
     response.writeHead(200, { 'content-type': 'text/event-stream' });
     const chunk = (delta: object, finish: string | null = null) => {
-      response.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: input.model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
+      response.write(
+        `data: ${JSON.stringify({
+          id: 'fixture',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: input.model,
+          choices: [{ index: 0, delta, finish_reason: finish }],
+        })}\n\n`,
+      );
     };
     chunk({ role: 'assistant' });
-    const roomMode = input.tools?.some((tool) => tool.function.name === 'room_action') && last?.role === 'user';
-    const roomInput = roomMode ? JSON.parse(content) as { messages: Array<{ id: string; text: string }>; pendingMessageIds: string[] } : undefined;
-    const pendingContent = roomInput?.messages.filter((m) => roomInput.pendingMessageIds.includes(m.id)).map((m) => m.text).join('\n') ?? '';
+    const roomMode =
+      input.tools?.some((tool) => tool.function.name === 'room_action') && last?.role === 'user';
+    const roomInput = roomMode
+      ? (JSON.parse(content) as {
+          messages: Array<{ id: string; text: string }>;
+          pendingMessageIds: string[];
+        })
+      : undefined;
+    const pendingContent =
+      roomInput?.messages
+        .filter((m) => roomInput.pendingMessageIds.includes(m.id))
+        .map((m) => m.text)
+        .join('\n') ?? '';
     if (roomMode && !pendingContent.includes('room-raw')) {
-      const args = pendingContent.includes('room-invalid') ? { action: 'reply', text: '' }
-        : pendingContent.includes('room-silent') ? { action: 'silent' }
-        : { action: 'reply', text: 'room fixture reply' };
-      const calls = [{ index: 0, id: 'room-call', type: 'function', function: { name: 'room_action', arguments: JSON.stringify(args) } }];
-      if (pendingContent.includes('room-multiple')) calls.push({ ...calls[0]!, index: 1, id: 'room-call-2' });
+      const args = pendingContent.includes('room-invalid')
+        ? { action: 'reply', text: '' }
+        : pendingContent.includes('room-silent')
+          ? { action: 'silent' }
+          : { action: 'reply', text: 'room fixture reply' };
+      const calls = [
+        {
+          index: 0,
+          id: 'room-call',
+          type: 'function',
+          function: { name: 'room_action', arguments: JSON.stringify(args) },
+        },
+      ];
+      if (pendingContent.includes('room-multiple'))
+        calls.push({ ...calls[0]!, index: 1, id: 'room-call-2' });
       chunk({ tool_calls: calls });
       chunk({}, 'tool_calls');
     } else if (toolCall) {
-      chunk({ tool_calls: [{ index: 0, id: 'call-fixture', type: 'function', function: { name: 'send_message', arguments: JSON.stringify({ to: 'agent:b', text: 'fixture question' }) } }] });
+      chunk({
+        tool_calls: [
+          {
+            index: 0,
+            id: 'call-fixture',
+            type: 'function',
+            function: {
+              name: 'send_message',
+              arguments: JSON.stringify({ to: 'agent:b', text: 'fixture question' }),
+            },
+          },
+        ],
+      });
       chunk({}, 'tool_calls');
     } else {
       chunk({ content: last?.role === 'tool' ? 'A concludes: fixture answer' : 'fixture answer' });
@@ -65,16 +115,37 @@ export async function fixtureProvider(options: { beforeReply?: (request: Provide
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('No fixture address');
   const modelsPath = join(directory, 'models.json');
-  await writeFile(modelsPath, JSON.stringify({ providers: { fixture: {
-    baseUrl: `http://127.0.0.1:${address.port}/v1`,
-    api: 'openai-completions', apiKey: 'fixture-only-key',
-    models: [{ id: 'fixture-model', name: 'Fixture', contextWindow: 128000, maxTokens: 1000, reasoning: false, input: ['text'] }],
-  } } }));
+  await writeFile(
+    modelsPath,
+    JSON.stringify({
+      providers: {
+        fixture: {
+          baseUrl: `http://127.0.0.1:${address.port}/v1`,
+          api: 'openai-completions',
+          apiKey: 'fixture-only-key',
+          models: [
+            {
+              id: 'fixture-model',
+              name: 'Fixture',
+              contextWindow: 128000,
+              maxTokens: 1000,
+              reasoning: false,
+              input: ['text'],
+            },
+          ],
+        },
+      },
+    }),
+  );
   return {
-    requests, directory, modelsPath,
+    requests,
+    directory,
+    modelsPath,
     async close() {
       server.closeAllConnections();
-      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
       await rm(directory, { recursive: true, force: true });
     },
   };

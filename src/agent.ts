@@ -1,6 +1,6 @@
 import type { RoomDecision, RoomObservation, RoomObserverContext } from './rooms/types.js';
 
-/** Stable participant identity: local user or registered agent. */
+/** Stable participant identity: a user or a registered agent. */
 export type ActorId = `user:${string}` | `agent:${string}`;
 
 /** Declared agent configuration. Credentials are env var names, never plaintext secrets. */
@@ -8,9 +8,15 @@ export interface AgentConfig {
   id: string;
   runtime: 'pi';
   model: { provider: string; id: string; apiKeyEnv?: string };
-  /** `replace` sets the base prompt; `append` adds to the runtime base. Engine communication rules are always appended. */
+  /**
+   * `replace` sets the base prompt; `append` adds to the runtime base.
+   * Engine communication rules are always appended.
+   */
   systemPrompt: { mode: 'replace' | 'append'; text: string };
-  /** Recipients this agent may message via runtime `send`. Default deny. */
+  /**
+   * Default-deny allowlist for directed `send` recipients.
+   * Room membership separately authorizes room replies.
+   */
   allowSendTo: ActorId[];
 }
 
@@ -66,8 +72,9 @@ export interface SendResult {
 }
 
 /**
- * Capabilities bound to the active agent turn.
- * Nested `send` waits for agent replies; replies are recorded but do not auto-trigger another inference.
+ * Capabilities bound to the active directed turn.
+ * Nested `send` waits for agent replies; those replies are recorded but do not
+ * start another inference on the caller.
  */
 export interface RuntimeContext {
   signal: AbortSignal;
@@ -75,9 +82,20 @@ export interface RuntimeContext {
   send(to: ActorId, text: string): Promise<SendResult>;
 }
 
-/** Loaded runtime instance: one conversation history per agent/conversation pair. */
+/**
+ * Directed receive returns a mandatory reply string; room observe may choose silence.
+ * Directed history is one session per agent/conversation; room observations do not share it.
+ */
 export interface AgentRuntime {
+  /**
+   * Handle a directed request. The engine records the returned text as the reply
+   * to the sender.
+   */
   receive(message: Readonly<Message>, context: RuntimeContext): Promise<string>;
+  /**
+   * Optional room participation. Missing support fails room use explicitly;
+   * the engine never falls back to `receive`.
+   */
   observe?(input: RoomObservation, context: RoomObserverContext): Promise<RoomDecision>;
   dispose(): void | Promise<void>;
 }
