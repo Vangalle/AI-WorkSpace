@@ -25,9 +25,13 @@ const server = createEngineServer(engine, {
   token,
   ...(userTokens === undefined ? {} : { userTokens }),
 });
+const reportShutdownFailure = () => {
+  console.error('Engine shutdown failed: one or more agents could not be cleaned up');
+  process.exitCode = 1;
+};
 server.on('error', (error: NodeJS.ErrnoException) => {
   console.error(`HTTP server failed: ${error.code ?? 'UNKNOWN'}`);
-  void engine.close().finally(() => {
+  void engine.close().catch(reportShutdownFailure).finally(() => {
     process.exitCode = 1;
   });
 });
@@ -49,7 +53,7 @@ const shutdown = () => {
   // Stop accepting connections, let the engine abort inference and close SSE,
   // then clean up remaining sockets.
   server.close();
-  void engine.close().finally(() => server.closeAllConnections());
+  void engine.close().catch(reportShutdownFailure).finally(() => server.closeAllConnections());
 };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

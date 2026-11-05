@@ -29,7 +29,7 @@ export interface Failure {
 /** Public agent status snapshot (no live runtime handle). */
 export interface AgentView {
   config: AgentConfig;
-  status: 'stopped' | 'loading' | 'running' | 'stopping' | 'failed';
+  status: 'stopped' | 'loading' | 'running' | 'stopping' | 'start_failed' | 'stop_failed';
   error?: Failure;
 }
 
@@ -97,10 +97,12 @@ export interface AgentRuntime {
    * the engine never falls back to `receive`.
    */
   observe?(input: RoomObservation, context: RoomObserverContext): Promise<RoomDecision>;
+  /** Idempotent; on failure retain unreleased resources so a later call can retry cleanup. */
   dispose(): void | Promise<void>;
 }
 
 /** Adapter that constructs a runtime from validated agent config. */
 export interface AgentRuntimeFactory {
+  /** Transfers runtime ownership on success; must clean up partial resources before rejecting. */
   load(config: AgentConfig): Promise<AgentRuntime>;
 }

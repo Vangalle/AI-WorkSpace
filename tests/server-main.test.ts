@@ -3,8 +3,11 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { test } from 'node:test';
 
-async function start(extraEnv: Record<string, string> = {}) {
-  const child = spawn(process.execPath, ['--import', 'tsx', 'src/main.ts'], {
+async function start(extraEnv: Record<string, string> = {}, bootstrap?: string) {
+  const entry = bootstrap
+    ? ['--input-type=module', '--eval', bootstrap]
+    : ['src/main.ts'];
+  const child = spawn(process.execPath, ['--import', 'tsx', ...entry], {
     env: { ...process.env, PORT: '0', ENGINE_TOKEN: 'server-main-admin-123456789012', ...extraEnv },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -46,6 +49,21 @@ test('server entry configures independent user credentials from ENGINE_USER_TOKE
   const response = await fetch(`${base}/health`, { headers: { authorization: `Bearer ${token}` } });
   assert.equal(response.status, 200);
   assert.equal(((await response.json()) as { principal: string }).principal, 'user:alice');
+});
+
+test('shutdown reports cleanup failure without an unhandled rejection', async (t) => {
+  const server = await start({}, `
+    import { AgentEngine } from './src/engine.ts';
+    AgentEngine.prototype.close = async () => { throw new Error('private cleanup detail'); };
+    await import('./src/main.ts');
+  `);
+  t.after(() => server.child.kill());
+  await server.url();
+  server.child.kill('SIGTERM');
+  const [code] = await server.exit;
+  assert.equal(code, 1);
+  assert.match(server.stderr(), /Engine shutdown failed/);
+  assert.doesNotMatch(server.stderr(), /private cleanup detail|unhandledRejection/);
 });
 
 test('invalid user credential configuration fails before listening without echoing secrets', async (t) => {

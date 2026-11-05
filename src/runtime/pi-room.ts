@@ -56,6 +56,7 @@ export function createPiRoomObserver(
   options: Pick<CreateAgentSessionOptions, 'cwd' | 'agentDir' | 'model' | 'modelRuntime'>,
 ) {
   const sessions = new Set<AgentSession>();
+  const openingSessions = new Set<Promise<unknown>>();
   let disposed = false;
 
   return {
@@ -95,7 +96,7 @@ export function createPiRoomObserver(
       };
       // Expose only room_action, not shell, file, or private messaging tools;
       // prompts alone cannot enforce this.
-      const { session } = await createAgentSession({
+      const opening = createAgentSession({
         ...options,
         thinkingLevel: 'off',
         tools: ['room_action'],
@@ -107,13 +108,20 @@ export function createPiRoomObserver(
           retry: { enabled: false },
         }),
       });
+      openingSessions.add(opening);
+      let session: AgentSession;
+      try {
+        ({ session } = await opening);
+      } finally {
+        openingSessions.delete(opening);
+      }
+      sessions.add(session);
       const cancel = () => {
         void session.abort().catch(() => {});
       };
       try {
         if (disposed) throw new EngineError('AGENT_STOPPED', 'Agent was stopped', 409);
         checkSignal(context.signal);
-        sessions.add(session);
         context.signal.addEventListener('abort', cancel, { once: true });
         await session.prompt(JSON.stringify(roomInput(input)), { expandPromptTemplates: false });
         checkSignal(context.signal);
@@ -142,14 +150,25 @@ export function createPiRoomObserver(
         return decision;
       } finally {
         context.signal.removeEventListener('abort', cancel);
-        sessions.delete(session);
-        session.dispose();
+        if (!disposed) {
+          session.dispose();
+          sessions.delete(session);
+        }
       }
     },
-    dispose(): void {
+    async dispose(): Promise<void> {
       disposed = true;
-      for (const session of sessions) session.dispose();
-      sessions.clear();
+      await Promise.allSettled([...openingSessions]);
+      const errors: unknown[] = [];
+      for (const session of sessions) {
+        try {
+          session.dispose();
+          sessions.delete(session);
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (errors.length) throw new AggregateError(errors, 'Room session cleanup failed');
     },
   };
 }

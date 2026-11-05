@@ -74,7 +74,16 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
       modelRuntime,
     });
     const sessions = new Map<string, { session: AgentSession; active?: RuntimeContext }>();
+    // Cache eviction revokes history reuse, not ownership of resources awaiting cleanup.
+    const liveSessions = new Set<AgentSession>();
+    const openingSessions = new Set<Promise<unknown>>();
     let disposed = false;
+
+    const disposeSession = (session: AgentSession) => {
+      if (!liveSessions.has(session)) return;
+      session.dispose();
+      liveSessions.delete(session);
+    };
 
     const openSession = async (conversationId: string) => {
       const existing = sessions.get(conversationId);
@@ -98,7 +107,7 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
           return { content: [{ type: 'text', text: JSON.stringify(result) }], details: {} };
         },
       };
-      const { session } = await createAgentSession({
+      const opening = createAgentSession({
         cwd: this.cwd,
         agentDir: this.agentDir,
         model,
@@ -113,10 +122,15 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
           retry: { enabled: false },
         }),
       });
-      if (disposed) {
-        session.dispose();
-        throw new EngineError('AGENT_STOPPED', 'Agent was stopped', 409);
+      openingSessions.add(opening);
+      let session: AgentSession;
+      try {
+        ({ session } = await opening);
+      } finally {
+        openingSessions.delete(opening);
       }
+      liveSessions.add(session);
+      if (disposed) throw new EngineError('AGENT_STOPPED', 'Agent was stopped', 409);
       entry.session = session;
       const ready = entry as { session: AgentSession; active?: RuntimeContext };
       sessions.set(conversationId, ready);
@@ -174,11 +188,11 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
             throw new EngineError('MODEL_ERROR', 'Model returned no text response', 502);
           return response;
         } catch (error) {
-          entry.session.dispose();
           // Late cleanup may run after a replacement exists;
           // remove only this entry, never its successor.
           if (sessions.get(message.conversationId) === entry)
             sessions.delete(message.conversationId);
+          if (!disposed) disposeSession(entry.session);
           throw error;
         } finally {
           context.signal.removeEventListener('abort', cancel);
@@ -187,9 +201,21 @@ export class PiRuntimeFactory implements AgentRuntimeFactory {
       },
       dispose: async () => {
         disposed = true;
-        roomObserver.dispose();
-        for (const { session } of sessions.values()) session.dispose();
+        const errors: unknown[] = [];
+        const roomCleanup = roomObserver.dispose().catch((error: unknown) => {
+          errors.push(error);
+        });
+        await Promise.allSettled([...openingSessions]);
         sessions.clear();
+        await roomCleanup;
+        for (const session of liveSessions) {
+          try {
+            disposeSession(session);
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+        if (errors.length) throw new AggregateError(errors, 'Runtime cleanup failed');
       },
     };
   }

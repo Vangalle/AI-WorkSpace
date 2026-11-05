@@ -264,7 +264,7 @@ test('engine revokes a completed nested agent capability before the root turn en
   assert.equal(engine.getConversation(conversationId).messages.length, 4);
 });
 
-test('engine rejects invalid config and reports loading errors as failed state', async (t) => {
+test('engine rejects invalid config and reports loading errors as start_failed', async (t) => {
   const engine = new AgentEngine({
     load: async () => {
       throw new Error('private path');
@@ -277,6 +277,6 @@ test('engine rejects invalid config and reports loading errors as failed state',
   assert.throws(() => engine.registerAgent(config('bad/id')), { code: 'INVALID_INPUT' });
   engine.registerAgent(config());
   await assert.rejects(engine.startAgent('a'), { code: 'RUNTIME_ERROR' });
-  assert.equal(engine.getAgent('a').status, 'failed');
+  assert.equal(engine.getAgent('a').status, 'start_failed');
   assert.equal(engine.getAgent('a').error?.message, 'Agent runtime failed');
 });

@@ -15,8 +15,15 @@ import { actor, agentConfig, identifier, invalid, sendInput, text } from './vali
 import { ChatRooms } from './rooms/chat-rooms.js';
 import { MAX_CONVERSATION_PARTICIPANTS } from './constants.js';
 
+interface Startup {
+  loaded: Promise<void>;
+  cancellation?: { reason: EngineError; stopped: Promise<AgentView> };
+}
+
 interface Instance extends AgentView {
   runtime?: AgentRuntime;
+  startup?: Startup;
+  stopping?: Promise<AgentView>;
 }
 
 /**
@@ -48,6 +55,7 @@ export class AgentEngine {
   >();
   private readonly turns = new Set<Turn>();
   private closed = false;
+  private closing?: Promise<void>;
   private readonly timeoutMs: number;
 
   readonly rooms: ChatRooms;
@@ -117,32 +125,58 @@ export class AgentEngine {
       throw new EngineError('AGENT_BUSY', 'Agent lifecycle operation in progress', 409);
     else if (instance.status === 'stopping')
       throw new EngineError('AGENT_BUSY', 'Agent is stopping, please try again later', 409);
+    if (instance.status === 'stop_failed')
+      throw new EngineError(
+        'AGENT_CLEANUP_REQUIRED',
+        'Retry stopping the agent before starting it',
+        409,
+      );
     instance.status = 'loading';
     delete instance.error;
+    const startup: Startup = {
+      loaded: Promise.resolve().then(async () => {
+        instance.runtime = await this.factory.load(structuredClone(instance.config));
+      }),
+    };
+    instance.startup = startup;
     try {
-      const runtime = await this.factory.load(structuredClone(instance.config));
-      if (this.closed) {
-        await runtime.dispose();
-        throw new EngineError('CLOSED', 'Engine is closed', 503);
+      try {
+        await startup.loaded;
+      } catch (error) {
+        if (!startup.cancellation) {
+          instance.status = 'start_failed';
+          instance.error = failure(error);
+          throw safeError(error);
+        }
       }
-      instance.runtime = runtime;
+      if (startup.cancellation) {
+        await startup.cancellation.stopped;
+        throw startup.cancellation.reason;
+      }
       instance.status = 'running';
       return this.getAgent(id);
-    } catch (error) {
-      instance.status = 'failed';
-      instance.error = failure(error);
-      throw safeError(error);
+    } finally {
+      if (instance.startup === startup) delete instance.startup;
     }
   }
 
-  /** Abort active turns that touch this agent, dispose its runtime, and allow restart. */
+  /** Cancel loading/active work and dispose the runtime. Concurrent stops share cleanup. */
   async stopAgent(id: string): Promise<AgentView> {
     const instance = this.instance(id);
-    if (instance.status === 'loading')
-      throw new EngineError('AGENT_BUSY', 'Agent lifecycle operation in progress', 409);
-    else if (instance.status === 'stopping')
-      throw new EngineError('AGENT_BUSY', 'Agent is currently in the process of stopping, please wait', 409);
+    if (instance.stopping) return instance.stopping;
+    if (instance.status === 'stopped') return this.getAgent(id);
     instance.status = 'stopping';
+    const startup = instance.startup;
+    const operation = this.disposeAgent(id, instance, startup?.loaded);
+    instance.stopping = operation;
+    if (startup && !startup.cancellation) {
+      startup.cancellation = {
+        reason: this.closed
+          ? new EngineError('CLOSED', 'Engine is closed', 503)
+          : new EngineError('AGENT_STOPPED', 'Agent was stopped', 409),
+        stopped: operation,
+      };
+    }
     const actorId = `agent:${id}` as const;
     this.rooms.cancelAgent(actorId);
     for (const turn of this.turns) {
@@ -150,13 +184,27 @@ export class AgentEngine {
         turn.controller.abort(new EngineError('AGENT_STOPPED', 'Agent was stopped', 409));
     }
     try {
+      return await operation;
+    } finally {
+      if (instance.stopping === operation) delete instance.stopping;
+    }
+  }
+
+  private async disposeAgent(
+    id: string,
+    instance: Instance,
+    loaded?: Promise<void>,
+  ): Promise<AgentView> {
+    // A rejected load owns its partial resources; a successful one transfers ownership here.
+    await loaded?.catch(() => {});
+    try {
       await instance.runtime?.dispose();
       delete instance.runtime;
       delete instance.error;
       instance.status = 'stopped';
       return this.getAgent(id);
     } catch (error) {
-      instance.status = 'failed';
+      instance.status = 'stop_failed';
       instance.error = failure(error);
       throw safeError(error);
     }
@@ -189,18 +237,29 @@ export class AgentEngine {
     return this.enqueue(`agent:${identifier(id)}`, input);
   }
 
-  /** Abort open turns and stop agents. Transcripts remain until process exit. */
-  async close(): Promise<void> {
-    if (this.closed) return;
+  /** Wait for all agent cleanup; repeated calls share the result, including an AggregateError on failure. */
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    // Shutdown events can synchronously reenter close(), so publish its result first.
+    this.closing = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
     this.closed = true;
     this.rooms.close();
     for (const turn of this.turns)
       turn.controller.abort(new EngineError('CLOSED', 'Engine is closed', 503));
-    await Promise.allSettled(
-      [...this.agents.keys()]
-        .filter((id) => this.instance(id).status !== 'loading')
-        .map((id) => this.stopAgent(id)),
-    );
+    void Promise.allSettled([...this.agents.keys()].map((id) => this.stopAgent(id)))
+      .then((results) => {
+        const errors = results.flatMap((result) =>
+          result.status === 'rejected' ? [safeError(result.reason)] : [],
+        );
+        if (errors.length) throw new AggregateError(errors, 'Failed to stop one or more agents');
+      })
+      .then(resolveClose, rejectClose);
+    return this.closing;
   }
 
   private async enqueue(from: ActorId, value: SendInput): Promise<SendResult> {
